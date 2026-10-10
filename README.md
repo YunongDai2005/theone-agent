@@ -1,252 +1,149 @@
-# The One
+<p align="center">
+  <img src="docs/images/hero.png" alt="The One dashboard on desktop and mobile: a task in progress, items that need you, today's numbers, and quota across four AI subscriptions" width="100%">
+</p>
 
-### One conversation. Your agents, coordinated.
+<h1 align="center">The One</h1>
 
-[![Tests](https://github.com/YunongDai2005/theone-agent/actions/workflows/test.yml/badge.svg)](https://github.com/YunongDai2005/theone-agent/actions/workflows/test.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Node.js 22+](https://img.shields.io/badge/Node.js-22%2B-green.svg)](package.json)
+<p align="center">
+  <b>One chat. A whole AI team behind it.</b><br>
+  Talk to your agents in WeChat the way you'd talk to a colleague. The One keeps your projects apart,<br>
+  remembers where each one left off, and spends your AI subscriptions where there's room.
+</p>
 
-**The One is an experimental personal AI system that manages conversations, preserves context, and coordinates agents based on task needs and available quotas.**
+<p align="center">
+  <a href="https://github.com/YunongDai2005/theone-agent/actions/workflows/test.yml"><img src="https://github.com/YunongDai2005/theone-agent/actions/workflows/test.yml/badge.svg" alt="Tests"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License"></a>
+  <a href="package.json"><img src="https://img.shields.io/badge/Node.js-22%2B-green.svg" alt="Node.js 22+"></a>
+  <img src="https://img.shields.io/badge/status-experimental-orange.svg" alt="Experimental">
+</p>
 
-Previously published as AI Box Gateway. The goal is simple: talk in one place while the system finds the right context and coordinates the work.
+<p align="center">
+  <b>English</b> · <a href="README.zh-CN.md">简体中文</a>
+  &nbsp;·&nbsp; <a href="https://YunongDai2005.github.io/theone-agent/demo/">Interactive demo</a>
+  &nbsp;·&nbsp; <a href="#try-it-in-one-minute">Try it</a>
+  &nbsp;·&nbsp; <a href="docs/DEPLOY.md">Deploy</a>
+</p>
 
-Keep talking, return to an earlier project, add a requirement, or stop a task. The design goal is for the system to manage conversation context and execution on your behalf.
+---
 
-The current implementation connects WeChat, OpenClaw, and a DSH command-line worker on Linux. It includes automatic topic routing, a Manager for conversations during execution, session handoffs, and a plugin-based execution pipeline.
+## Why
 
-[Design goal](#design-goal) · [Current capabilities](#what-works-today) · [Quick start](#try-the-replay-tests) · [Roadmap](#roadmap) · [Contributing](#contributing)
+You already pay for several AI tools. Using them is still a job:
 
-## Watch the replay
+- **You decide which chat a question belongs to.** The One reads each message and drops it into the right project, picking up that project's own session and memory.
+- **The agent goes quiet for twenty minutes.** A Manager answers you straight away, passes along changes, and stops the work the moment you say stop.
+- **You juggle 5-hour, weekly, and monthly limits.** Work goes to whichever subscription still has room, and to the one about to reset first.
 
-[![One chat, three sessions, and quota-aware advisor selection](docs/demo/preview.gif)](https://YunongDai2005.github.io/theone-agent/demo/)
+## What it does
 
-**[Open the interactive demo →](https://YunongDai2005.github.io/theone-agent/demo/)**
-
-Seven messages move between a website, battery research, and a Python tool without session selectors or switch commands. The recorder verifies that returning to each topic restores its original worker session ID. A separate advisor scene shows quota filtering and a simulated Manager choice for a coding task.
-
-**This is a reproducible replay, not a live product recording:** gateway/session code and advisor selection functions are real; messages, model decisions, quota balances, and the worker are test fixtures. It demonstrates routing mechanics, not real-model accuracy or concurrent task execution. The visual captions describe verified state rather than actual worker replies.
-
-```bash
-npm run demo:record
-# Open docs/demo/index.html in your browser
-```
-
-See the [recorder and evidence](demo/README.md). The viewer is self-contained and can be opened locally.
-
-## Design goal
-
-> **Users should not have to manage sessions. The system should keep their tasks separate, preserve context, and follow through.**
-
-A single conversation can contain several ongoing projects. A dedicated Session Administrator should find the right existing context or create a new session. The Manager should coordinate tasks and advisors within that context.
-
-### The experience we are building toward
-
-*Illustrative interaction, not a recorded demo:*
-
-```text
-You:      Help me prepare the website launch.
-Manager:  I'll help prepare the launch.
-
-You:      Back to the Python tool we discussed yesterday: add CSV export.
-Manager:  I'll add CSV export to the Python tool.
-
-You:      Also include column headers.
-Manager:  I'll attach that requirement to the CSV export task.
-
-You:      How is the website going?
-Manager:  [Reports the website task's actual state.]
-```
-
-The user stays in one chat. Behind it, the system keeps track of:
-
-- **Conversation identity:** continue an existing topic or create a new one.
-- **Message intent:** a follow-up, correction, stop request, status question, or separate task.
-- **Execution state:** what is running, waiting, completed, or blocked.
-- **Context continuity:** which session, handoff, and prior decisions a worker needs.
-
-This is the direction of the project. The dedicated Session Administrator, hierarchical advisor archives, durable scheduling, and independent concurrent topic execution are roadmap work.
-
-## What works today
-
-| Capability | Current implementation |
+| | |
 | --- | --- |
-| Automatic session routing | Topic matching uses lexical/entity candidates and model judgment to stay in a session, resume another topic, or create one. |
-| Conversation during execution | While the worker is busy, the Manager can answer status questions, relay notes, queue another request, or request interruption. |
-| Interruptions and corrections | The Manager distinguishes conflicting or urgent changes from compatible additions. Revisions wait for confirmed worker exit, preserve prior requirements and unread additions, and reject decisions tied to an outdated run. |
-| Context handoffs | Session metadata, handoff documents, and recall hooks help carry context into another session. |
-| Media handling | The WeChat adapter handles text, voice transcripts, images, and file delivery. |
-| Quota-aware advisor scheduling | Helper auto-selection filters unavailable or nearly exhausted providers, then asks a Manager model to choose using task difficulty, remaining quota, reset windows, and usage preferences. A rule-based fallback handles unavailable Manager responses. |
-| Quota-aware execution routing | Before each turn the main worker picks Go, WorkBuddy, or DeepSeek from one shared quota policy (safety reserves, in-flight reservations, near-reset priority, concurrency caps), with a two-tier fallback when a route fails. A reading past its reset time is shown as "reset pending" until a fresh reading confirms it. |
-| Resident worker mode (optional) | With `dshTransport: "service"`, the gateway drives a long-running local DSH service. Compatible additions are steered into the worker's next step instead of restarting the turn; native questions and tool approvals are relayed to the chat; orphaned runs are cleaned up on restart. |
-| Delivery receipts | Manager notes move through `pending → accepted → delivered → applied` in an append-only ledger, so a note that was only accepted is never reported as handled. |
-| Modular dashboard | Each feature registers its own cards (`app.widget`). JSON cards placed in `~/.aibox/widgets/` load without a restart. `web/index.html` renders desktop and mobile layouts from `GET /api/v2/board`. |
-| Optional helper workers | Scripts can invoke additional model/CLI helpers, including worktree-based code tasks. |
-| Optional review and improvement | Signals, bounded parameter tuning, and proposed code changes with approval and deployment steps. |
-| Replay testing | Fake messaging, worker, and model services exercise the gateway without real accounts. |
+| **Talk while it works** | While the worker is busy, the Manager answers status questions, files your additions, and interrupts only when a new instruction conflicts with what's running. |
+| **Never pick a session** | Each message is routed to its topic automatically. Return to yesterday's project and its context comes back. Say "切错了" ("wrong topic") to undo a switch. |
+| **Never lose context** | When a session fills up, a new day starts, or you've been away for hours, the old session writes a handoff and the new one picks it up. |
+| **Spend quota wisely** | One quota policy across Go, ChatGPT, Claude Code, and WorkBuddy: safety reserves, in-flight reservations, near-reset first, and a fallback when a route fails. |
+| **See it at a glance** | A dashboard for desktop and phone: what the worker is doing now, what needs you, today's numbers, quota with reset countdowns. |
+| **Improves itself, with your OK** | Each night it reviews the previous day. It tunes a few parameters within fixed limits and writes improvement proposals that only ship after you approve them in chat. |
 
-### Current boundaries
+## See it
 
-- **The Manager is not yet the universal entry point.** It primarily handles messages while the worker is busy; ordinary topic routing is a separate stage in the execution pipeline.
-- **Execution is serial per chat.** Multiple topic sessions exist, but independent topics in one chat do not yet execute concurrently through the main queue.
-- **The local queue is in memory.** Service mode cleans up orphaned worker runs and Manager notes carry delivery receipts, but accepted tasks are not yet persisted and replayed after a restart.
-- **New Manager notes carry chat, run, and topic bindings.** Scoped workers read their own notes; deferred delivery waits for the matching foreground topic. Legacy unbound notes and global question files still need migration before broader multi-user use.
-- **This is a source release for integration.** Real deployment requires your own DSH configuration, OpenClaw WeChat plugin, accounts, and model access.
+<p align="center">
+  <a href="https://YunongDai2005.github.io/theone-agent/demo/"><img src="docs/demo/preview.gif" alt="Replay: one chat, three projects, each resuming its own session" width="80%"></a>
+</p>
 
-## Interruption policy
+<p align="center"><a href="https://YunongDai2005.github.io/theone-agent/demo/"><b>Open the interactive replay →</b></a><br>
+<sub>Seven messages across a website, battery research, and a Python tool, with no session switching. Routing and session code are real; messages, model decisions, and the worker are fixtures.</sub></p>
 
-While the Manager is enabled, it compares new instructions with the current task and execution step. Conflicting requirements or constraints that must apply immediately trigger interruption and a revised continuation. Compatible additions go to the mailbox; agreement and status questions do not restart work. Independent requests are queued for topic routing.
+<table>
+  <tr>
+    <td align="center"><img src="docs/images/mobile-home.png" width="250" alt="Home on a phone"><br><sub>Home: the task in progress and what needs you</sub></td>
+    <td align="center"><img src="docs/images/mobile-memory.png" width="250" alt="Memory page"><br><sub>Memory: topics, handoffs, knowledge</sub></td>
+    <td align="center"><img src="docs/images/mobile-evolve.png" width="250" alt="Evolve page"><br><sub>Evolve: nightly review and proposals</sub></td>
+  </tr>
+</table>
 
-A replacement starts only after the target worker process has exited. Completed side effects are not rolled back. If the run changes while a decision is pending, the system asks for clarification rather than applying it to another run. Model classification is still fallible; the replay tests validate handling of simulated decisions, not real-model accuracy. The legacy steering path remains available when the Manager is disabled.
+## Try it in one minute
 
-## Architecture
-
-The current transport path:
-
-```text
-WeChat <--> Tencent iLink <--> The One gateway <--> OpenClaw WeChat plugin
-                                     |
-                         Commands and ingress handlers
-                                     |
-                      +--------------+--------------+
-                      |                             |
-              Manager when busy              Per-chat queue
-                      |                             |
-            Reply / note / redirect           Topic routing
-                      |                             |
-                      +----------------------> Session context
-                                                    |
-                                                DSH worker
-                                                    |
-                                         Reply and state updates
-```
-
-WeChat provides the current entry point. The core product idea is **conversation and session orchestration**; the planned separation of responsibilities is described below.
-
-## Planned roles and memory hierarchy
-
-**Design proposal; this complete flow is not implemented yet.** The existing topic router and model judge are the starting point for the Session Administrator.
-
-| Role | Responsibility |
-| --- | --- |
-| Session Administrator | Find the relevant conversation, resolve references and pending answers, and propose session reuse or creation. Index advisor findings under their parent tasks. |
-| Manager | Interpret the requested action within the assigned context, coordinate execution, and choose advisors using task needs, quotas, reset windows, and user preferences. |
-| Workers and advisors | Execute scoped tasks and return findings, artifacts, and verification evidence. |
-| Runtime | Validate IDs and permissions, persist state, enforce resource constraints, and apply session or execution changes. |
-
-```text
-User topic
-  └─ Task
-      ├─ Main worker session and handoffs
-      ├─ Advisor job → session, findings, artifacts, verification
-      └─ Advisor job → session, findings, artifacts, verification
-```
-
-Advisor jobs should receive their topic and task IDs when created. Their archive destination is determined by those IDs; AI helps summarize and retrieve the records. An advisor suggestion, a verified result, and a merged change remain distinct states. Provider changes use handoff summaries when sessions cannot be resumed across tools.
-
-Switching the foreground conversation must not implicitly stop a running task. Consequential ambiguity should trigger a short clarification. Runtime validation and durable task records must support these decisions before broader autonomous scheduling.
-
-## Try the replay tests
-
-Requires **Node.js 22+**. The tests use built-in Node modules: no `npm install`, WeChat account, or model credentials are required.
+No WeChat account, API keys, or `npm install` needed. Node.js 22+ is enough.
 
 ```bash
 git clone https://github.com/YunongDai2005/theone-agent.git
 cd theone-agent
-npm test
+
+npm test                        # 70+ replay scenarios and unit tests against fake services
+node test/dev-dashboard.mjs     # live dashboard with sample data → http://127.0.0.1:8933/
+npm run demo:record             # rebuild the replay → open docs/demo/index.html
 ```
 
-The published v2 snapshot passed **50 test entries**, including unit-test groups and replay scenarios, locally and in Linux CI. The badge above shows the latest CI status.
+Everything runs on loopback in temporary directories. Nothing touches a real account.
 
-Fake services bind to loopback addresses and use isolated temporary directories. Tests cover routing, sessions, media, interruptions, Manager interactions, handoffs, and review workflows. They do not establish real-provider compatibility or production routing accuracy.
+## Talk to it
 
-```bash
-# Optional comparison with the legacy v1 implementation
-npm run test:both
-```
+Plain sentences are fine. These commands give you direct control:
 
-The legacy comparison has known failures documented in the [validation record](docs/VALIDATION.md) (Chinese). v2 is the primary implementation.
-
-## Deploy with your own integrations
-
-### Prerequisites
-
-- Linux; systemd user services for the supplied service and helper workflows.
-- Node.js 22+ and a configured DSH CLI with a `headless` profile.
-- OpenClaw with its WeChat plugin and your own iLink account.
-- Your own model credentials and provider configuration.
-- Python 3 and `zstdcat` for the optional session-history tools.
-
-The complete supporting scripts use this example layout:
-
-```text
-/home/aibox/wx-router/      Repository checkout
-/home/aibox/bin/            Scripts installed from this repository's bin/
-/home/aibox/dsh-work/       Worker workspace
-/home/aibox/.dsh/           Your DSH profiles and credentials
-/home/aibox/.openclaw/      Your OpenClaw installation and WeChat plugin
-/home/aibox/.aibox/         Generated local state
-```
-
-1. Place the repository at `/home/aibox/wx-router`. Inspect `~/bin` for name conflicts before copying the supplied `bin/` scripts there, and create `~/dsh-work`.
-2. Copy `config.example.json` to `config.json`. Set `accountFile`, `pluginDir`, `dshBin`, `dshCwd`, provider/model settings, and `realBase` for your installation.
-3. **Set `realBase` to the original iLink upstream.** Configure the OpenClaw WeChat channel to use the local proxy at `http://127.0.0.1:8787`. Using that proxy address as the upstream would create a loop.
-4. Configure the DSH `headless` profile and its fallback patch yourself. Manager model calls read `OPENCODE_GO_API_KEY` and `DEEPSEEK_API_KEY` (and, if you run a local WorkBuddy gateway, `WORKBUDDY_GATEWAY_API_KEY`) from `~/.dsh/.credentials.yaml`. Adjust provider endpoints and model names to your available services.
-5. Run `npm start` in the foreground. Check `/healthz` and `http://127.0.0.1:8788/api/v2/status`, then verify the real messaging path. Only then install `ops/wx-router.service`, adjusting its Node executable path.
-
-The v2 core supports `AIBOX_HOME`, `AIBOX_ROOT`, and `AIBOX_CONFIG`. Legacy v1 and some `bin/` and `ops/` scripts still assume `/home/aibox`; a different layout requires corresponding edits. The WeChat adapter imports plugin internals, so verify the module layout against your installation.
-
-The example configuration disables helper workers, local-model routing, and automated review. Configure their dependencies before enabling them. Two hardware- or privacy-sensitive plugins are off by default: `transcript` (keeps a local copy of incoming message text) and `sdr` (controls a local radio receiver service).
-
-The dashboard frontend is `web/index.html`: serve it with any static web server and proxy `/api/v2/*` to `127.0.0.1:8788`. To preview it with fake data, run `node test/dev-dashboard.mjs` and open `http://127.0.0.1:8933/`. Machine-status cards read an optional `systemStatusUrl`; without one they show as unavailable. MCP control services, third-party frameworks, and model weights are not bundled.
-
-### Privacy and access
-
-The proxy and status API default to loopback. The status API does not provide a complete public-facing authentication layer. Keep it private, and choose worker permissions appropriate to your machine.
-
-The published repository excludes account files, credentials, private conversations, personal knowledge, runtime state, and the original Git history. Runtime logs and handoffs can still contain private content: inspect them before sharing. See [security notes](SECURITY.md) (Chinese).
-
-## Roadmap
-
-The priorities follow the single-chat experience:
-
-- [ ] **Dedicated Session Administrator:** resolve current, previous, or new sessions using topic summaries, task state, and pending questions; retain direct handling for explicit stop requests.
-- [ ] **Manager coordination:** consume validated session assignments and coordinate tasks and advisors without repeating the routing decision.
-- [ ] **Advisor continuity and archives:** bind advisor sessions, findings, artifacts, and verification status to their parent tasks; resume compatible sessions or provide a handoff summary.
-- [ ] **Explicit task binding:** associate notes, corrections, questions, and results with a conversation, topic, and task ID.
-- [ ] **Durable scheduling:** persist accepted tasks and delivery state; recover safely after restarts and avoid duplicate execution.
-- [ ] **Ambiguity handling:** use task state and recent references to resolve follow-ups; ask a short clarification when a consequential choice remains unclear.
-- [ ] **Independent topic execution:** allow bounded concurrency across unrelated sessions while serializing work that shares context or resources.
-- [ ] **Routing evaluation:** add labeled replay cases for topic switches, next-day continuations, interruptions, corrections, and ambiguous references.
-
-## Repository map
-
-| Path | Responsibility |
+| Send | What happens |
 | --- | --- |
-| `src/manager/` | Manager decisions and worker communication |
-| `src/memory/` | Topic routing, matching, and topic splitting |
-| `src/agent/` | Execution pipeline, queues, sessions, and interruption |
-| `src/plugins/` | Manager, topics, progress, stop, handoff, and other features |
-| `src/core/` | Configuration, plugin registration, logging, and model clients |
-| `src/channel/` | WeChat transport and media handling |
-| `src/evolve/` | Review signals, bounded tuning, and improvement proposals |
-| `src/observe/` | Live run state, daily metrics, and the dashboard card registry |
-| `src/tools/` | Command-line tools, such as `widget` for checking and adding dashboard cards |
-| `web/` | Dashboard frontend (a renderer for the cards served by the gateway) |
-| `bin/` and `ops/` | Optional helper tools and Linux operations examples |
-| `test/` | Fake services, replay scenarios, and unit tests |
+| *anything* | Goes to the right topic and the worker starts on it |
+| `停` | Stops the current task immediately (typed or by voice) |
+| `/进度` | What the worker is doing right now |
+| `/new` | Start a new topic. Old ones are kept and resume when you return to them |
+| `切错了` | The last message went to the wrong topic: undo and answer it in the right one |
+| `/话题` | List your topics |
+| `/经理` | Manager status, unread notes, open questions from the worker |
+| `/回答 N …` · `/通过 N` · `/拒绝 N` | Answer the worker's question or approve/deny a tool action |
+| `/进化` | Last night's review and proposals |
+| `/批准 N` · `/上线 N` · `/否决 N` | Approve a proposal for implementation, ship it, or drop it |
+| `/看板 <what you want to see>` | Ask the worker to add a dashboard card |
+| `/帮助` | Every command |
 
-Detailed documents currently remain in Chinese: [architecture](docs/ARCHITECTURE.md), [review workflow](docs/EVOLVE.md), [dashboard cards](docs/WIDGETS.md), [resident worker mode](docs/DSH-SERVICE.md), [quota routing](docs/QUOTA-ROUTING.md), [project inventory](docs/PROJECT-OVERVIEW.md), and [publication scope](docs/PUBLICATION.md).
+## How it works
+
+```mermaid
+flowchart LR
+    U([You in WeChat]) <--> G[The One gateway]
+    G --> T[Topic router]
+    G --> M[Manager]
+    T --> W[Worker<br/>DSH agent]
+    M -. notes, stop, questions .-> W
+    W --> A[Advisors<br/>Claude Code · Codex · Go · WorkBuddy]
+    Q[(Quota policy)] -. picks route .-> W
+    Q -. picks advisor .-> A
+    G --> D[Dashboard<br/>desktop and mobile]
+```
+
+The gateway sits between WeChat (via Tencent iLink and the OpenClaw WeChat plugin) and a DSH (DeepSeek Harness) command-line agent on a Linux machine. Every feature is a plugin: topics, Manager, handoffs, progress, quota, dashboard cards, self-review. Each plugin attaches to a small set of hooks, so features can be turned off one at a time and new ones can bring their own dashboard cards. See [architecture](docs/ARCHITECTURE.md) and [design](docs/DESIGN.md).
+
+## Run it for real
+
+You need a Linux machine, the DSH agent CLI, the OpenClaw WeChat plugin with a bot account, and at least one model subscription or API key.
+
+1. Copy `config.example.json` to `config.json` and point it at your plugin, account file, and worker.
+2. Route the OpenClaw WeChat channel through the gateway at `http://127.0.0.1:8787`.
+3. Run `npm start` and check `http://127.0.0.1:8788/api/v2/status`.
+4. Serve `web/index.html` and proxy `/api/v2/*` to the gateway to get the dashboard.
+
+The full guide, including credentials, optional plugins, and privacy notes, is in **[docs/DEPLOY.md](docs/DEPLOY.md)**.
+
+## Status
+
+The One is experimental. One person built it and runs it every day on a single home server.
+
+- **Serial per chat.** Topics keep separate sessions, but one chat runs one task at a time.
+- **Restart-safe only in part.** Worker runs are cleaned up after a restart, but queued tasks live in memory.
+- **Model judgment can be wrong.** Topic routing and the Manager's decisions use models. The tests check how decisions are handled, not how accurate the models are.
+
+Next up: a dedicated session administrator, durable task scheduling, and bounded parallel work across unrelated topics. See the [roadmap](docs/DESIGN.md#roadmap).
 
 ## Contributing
 
-Contributions around **conversation routing, session memory, interruption handling, and reliable scheduling** are especially useful.
+The most useful help is on **conversation routing, session memory, interruption handling, and reliable scheduling**.
 
-- For routing issues, provide a short **synthetic or redacted conversation**, the expected target topic, and what happened instead.
-- For code changes, read the architecture document, prefer a plugin when appropriate, add a replay case for the behavior, and run `npm test`.
-- English translations of the detailed docs and reproducible integration guides are welcome.
+- Routing bug? Open an issue with a short synthetic or redacted conversation, the topic you expected, and what happened.
+- Code? Read the [architecture](docs/ARCHITECTURE.md), prefer a plugin, add a replay scenario, and run `npm test`.
+- Detailed docs are in Chinese. English translations are welcome.
 
-If this is a system you want to use or help build, **star the repository** and share the conversation patterns you need it to handle in [Issues](https://github.com/YunongDai2005/theone-agent/issues).
+If this is a system you'd use, **star the repo** and tell us in [Issues](https://github.com/YunongDai2005/theone-agent/issues) which conversations it should handle.
 
 ## License
 
-[MIT](LICENSE). External frameworks, plugins, CLIs, and model services retain their own licenses and terms. Their code, model weights, and credentials are not redistributed here.
+[MIT](LICENSE). Frameworks, plugins, CLIs, and model services keep their own licenses and terms; none of their code, weights, or credentials are included. Formerly published as *AI Box Gateway*.

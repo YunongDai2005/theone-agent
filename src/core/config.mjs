@@ -88,6 +88,7 @@ export const DEFAULTS = {
   threadRouter: true,
   threadRouterShadow: false,
   threadTh: {},
+  brand: 'The One',   // 面板上显示的名字
   dashboardUrl: 'http://127.0.0.1/',
   systemStatusUrl: 'http://127.0.0.1/api/status',   // 面板后端的机器状态（系统卡片用）
   llm: {

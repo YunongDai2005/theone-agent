@@ -13,7 +13,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths } from '../core/config.mjs';
+import { cfg, paths } from '../core/config.mjs';
 import { log, errText, recentEvents } from '../core/log.mjs';
 import * as metrics from './metrics.mjs';
 
@@ -165,7 +165,7 @@ export async function board(app, page = 'home') {
   }));
   const bs = {};
   for (const [p, fn] of badges) { try { const v = await withTimeout(Promise.resolve(fn()), 2000); if (v) bs[p] = v; } catch {} }
-  return { page, pages: pages().map((p) => ({ ...p, badge: bs[p.id] || null })), widgets: widgets.filter(Boolean), at: Date.now() };
+  return { brand: cfg.brand, page, pages: pages().map((p) => ({ ...p, badge: bs[p.id] || null })), widgets: widgets.filter(Boolean), at: Date.now() };
 }
 
 export async function detail(app, id) {

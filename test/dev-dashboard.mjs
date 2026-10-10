@@ -34,7 +34,7 @@ const env = await startEnv({
       const d = ymd(Date.now() - i * 86400e3), ok = rnd(8, 22), bad = rnd(0, 3);
       env.writeJson('.aibox/evolve/metrics/' + d + '.json', { day: d, counters: { 'msg.in': ok + bad + 9, 'turn.done': ok, 'turn.empty': bad, 'topic.misroute': rnd(0, 1), 'signal.complaint': rnd(0, 2) }, dist: { 'turn.ms': Array.from({ length: ok }, () => rnd(8000, 240000)) } });
     }
-    env.writeJson('.aibox/quota.json', { updatedAt: new Date().toISOString(), go: { ok: true, windows: { '5小时': { usedPercent: 12, resetsAt: iso(2.3 * 3600e3) }, '每周': { usedPercent: 31, resetsAt: iso(3.4 * 86400e3) }, '每月': { usedPercent: 18, resetsAt: iso(20 * 86400e3) } }, pace: { used: 18 } }, chatgpt: { ok: true, windows: { '5小时': { usedPercent: 100, resetsAt: iso(14 * 60e3) }, '每周': { usedPercent: 40, resetsAt: iso(5.2 * 86400e3) } }, advisor: { calls: 0 } }, claude: { ok: true, windows: { '5小时': { usedPercent: 71, resetsAt: iso(2.1 * 3600e3) }, '每周': { usedPercent: 26, resetsAt: iso(4 * 86400e3) } }, advisor: { calls: 22 } }, deepseek: { ok: true, balance: 26.4, currency: 'CNY' } });
+    env.writeJson('.aibox/quota.json', { updatedAt: new Date().toISOString(), go: { ok: true, windows: { '5小时': { usedPercent: 12, resetsAt: iso(2.3 * 3600e3) }, '每周': { usedPercent: 31, resetsAt: iso(3.4 * 86400e3) }, '每月': { usedPercent: 18, resetsAt: iso(20 * 86400e3) } }, pace: { used: 18 } }, chatgpt: { ok: true, windows: { '5小时': { usedPercent: 38, resetsAt: iso(3.2 * 3600e3) }, '每周': { usedPercent: 40, resetsAt: iso(5.2 * 86400e3) } }, advisor: { calls: 0 } }, claude: { ok: true, windows: { '5小时': { usedPercent: 71, resetsAt: iso(2.1 * 3600e3) }, '每周': { usedPercent: 26, resetsAt: iso(4 * 86400e3) } }, advisor: { calls: 22 } }, deepseek: { ok: true, balance: 26.4, currency: 'CNY' }, workbuddy: { ok: true, plan: '月套餐', windows: { '每月': { usedPercent: 35, resetsAt: iso(18 * 86400e3) } } } });
     // 上一次调用花了多少（虚线段）：Go 看额度历史，Claude 看外援账本
     const q = env.readJson('.aibox/quota.json');
     const h = (u5) => ({ t: Date.now(), go: { '5小时': { u: u5, r: q.go.windows['5小时'].resetsAt }, '每周': { u: 28, r: q.go.windows['每周'].resetsAt } } });
@@ -46,9 +46,9 @@ const env = await startEnv({
     env.writeJson('.aibox/evolve/proposals/0001.json', { id: '0001', status: 'proposed', createdAt: Date.now() - 5 * 3600e3, title: '追问句别当成新话题', problem: '昨天 2 次「切错了」都在「那这个呢」这类追问之后。', change: 'threads.mjs 的 isTrivial 补追问句式。', kind: 'prompt', risk: '低', history: [] });
     env.writeJson('wx-router/tunables.json', { values: { threadTh: { switchSure: 0.77 } }, history: [{ at: Date.now() - 5 * 3600e3, key: 'threadTh.switchSure', from: 0.75, to: 0.77, reason: '昨天切错 2 次', level: 'L1' }] });
     fs.mkdirSync(env.file('dsh-work/handoffs'), { recursive: true });
-    fs.writeFileSync(env.file('dsh-work/handoffs/INDEX.md'), '| # | 时间 | 标题 | 关键词 | 文件 |\n|---|---|---|---|---|\n| 0001 | 09-27 10:00 | 修好看门狗 | x | a |\n| 0002 | 09-28 11:00 | 装知识库 | x | b |\n');
+    fs.writeFileSync(env.file('dsh-work/handoffs/INDEX.md'), '| # | 时间 | 标题 | 关键词 | 文件 |\n|---|---|---|---|---|\n| 0001 | 09-27 10:00 | 官网改版：首页结构定稿 | x | a |\n| 0002 | 09-28 11:00 | 论文笔记：第三章整理完 | x | b |\n| 0003 | 09-28 21:30 | 杭州周末行程 | x | c |\n');
     const d = env.file('.aibox/helper-jobs/c-0929-101500-ab'); fs.mkdirSync(d, { recursive: true });
-    fs.writeFileSync(path.join(d, 'meta.json'), JSON.stringify({ helper: 'claude', status: 'done', title: '查 Go 计费规则', startedAt: new Date(Date.now() - 3 * 3600e3).toISOString(), endedAt: new Date(Date.now() - 2.8 * 3600e3).toISOString(), announced: true }));
+    fs.writeFileSync(path.join(d, 'meta.json'), JSON.stringify({ helper: 'claude', status: 'done', title: '审一下官网改版的代码', startedAt: new Date(Date.now() - 3 * 3600e3).toISOString(), endedAt: new Date(Date.now() - 2.8 * 3600e3).toISOString(), announced: true }));
     // 一张"不写代码"的卡片示例：知识库条目数
     fs.mkdirSync(env.file('dsh-work/knowledge'), { recursive: true });
     for (let i = 0; i < 45; i++) fs.writeFileSync(env.file('dsh-work/knowledge/k' + i + '.md'), 'x');
@@ -57,8 +57,9 @@ const env = await startEnv({
   },
 });
 await env.say('/dsh'); await env.waitText('已切换');
-for (const t of ['帮我看下网关重构进度', '把面板的配色调一下']) { await env.say(t); await env.waitText('ECHO:' + t); await env.idle(); }
-await env.say('把网关重构成模块化的产品，顺便把面板改好看 #sleep=600000 #milestone=新网关骨架写完');   // 一直在跑，看"干活中"的样子
+for (const t of ['把这周的周报整理成三条要点', '查一下周六上午去杭州的高铁']) { await env.say(t); await env.waitText('ECHO:' + t); await env.idle(); }
+// 前 40 个字之后才放指令，面板标题只显示前面的正常文字
+await env.say('帮我把官网首页的文案改得更有说服力，再写三个版本的标题给我挑一挑，改完发预览链接给我 #sleep=600000 #milestone=首页文案初稿写完');   // 一直在跑，看"干活中"的样子
 
 const html = () => fs.readFileSync(path.join(APP_DIR, 'web/index.html'));
 http.createServer(async (req, res) => {

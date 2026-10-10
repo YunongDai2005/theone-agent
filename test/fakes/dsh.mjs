@@ -45,7 +45,11 @@ const until = Date.now() + Number(d.sleep || 0);
 let n = 0;
 while (Date.now() < until) {
   const callId = 'c' + (++n);
-  out({ type: 'tool_call', tool: 'bash', callId, input: { command: 'sleep 0.3', description: '第 ' + n + ' 步' } });
+  // 动作描述像真实任务（面板预览、演示截图用）；每 4 个动作算一步
+  const ACTS = [['read_file', '读取首页文案'], ['web_search', '对比三家竞品官网'], ['edit_file', '改写首屏标题'], ['write_file', '生成三个标题方案'], ['bash', '检查移动端排版'], ['read_file', '核对品牌用词表']];
+  const [tool, what] = ACTS[(n - 1) % ACTS.length];
+  if (n > 1 && (n - 1) % 4 === 0) out({ type: 'status', phase: 'step_start' });
+  out({ type: 'tool_call', tool, callId, input: { command: 'sleep 0.3', description: what } });
   await sleep(Math.min(300, Math.max(0, until - Date.now())));
   out({ type: 'tool_result', callId, status: 'completed' });
 }
