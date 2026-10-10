@@ -36,7 +36,7 @@ You already pay for several AI tools. Using them is still a job:
 
 ## What it does
 
-| | |
+| Feature | What you get |
 | --- | --- |
 | **Talk while it works** | While the worker is busy, the Manager answers status questions, files your additions, and interrupts only when a new instruction conflicts with what's running. |
 | **Never pick a session** | Each message is routed to its topic automatically. Return to yesterday's project and its context comes back. Say "切错了" ("wrong topic") to undo a switch. |
