@@ -21,10 +21,15 @@
     "helpers": false,
     "local": false,
     "observe": true,
-    "evolve": false
+    "evolve": false,
+    "board": true,
+    "system": true,
+    "transcript": false,
+    "sdr": false
   },
   "evolve": {
     "autoTune": false,
     "proposals": false
-  }
+  },
+  "dshTransport": "headless"
 }

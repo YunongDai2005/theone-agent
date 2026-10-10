@@ -14,14 +14,17 @@
  *   stop                 置 true = 后面的阶段都不跑了
  *   cleanups             finally 里要执行的收尾（例如停掉进度播报）
  */
+import { receipt } from '../manager/receipts.mjs';
 import { cfg } from '../core/config.mjs';
 import { log, emit, errText, tag } from '../core/log.mjs';
 import * as wx from '../channel/wechat.mjs';
 import * as S from './session.mjs';
 import * as live from '../observe/live.mjs';
+import { dispatchSnapshot, reservations } from '../core/quota-runtime.mjs';
+import { workerRoute } from '../core/quota-policy.mjs';
 import { runDsh, noFinal, isQuotaErr, isSessionLost, coolingDown, setGoCooldown, ocSession, refreshQuota } from './dsh.mjs';
 import { registerActiveRun, beginGeneration, activeRuns, interruptCurrentRun } from './runs.mjs';
-import { enqueue, queueBusy } from './queue.mjs';
+import { enqueue, queueBusy, clearQueued } from './queue.mjs';
 
 // ---------- 核心阶段（作为 core 插件挂上去） ----------
 export const corePlugin = {
@@ -71,10 +74,25 @@ export const corePlugin = {
     app.stage('run', 50, async (T) => {
       const { chat, run } = T;
       const oc = ocSession(chat, T.sid);
-      const cd = coolingDown();
-      run.setRoute(cd ? 'deepseek' : 'go');
       const gen = beginGeneration(chat), reg = registerActiveRun(chat);
-      const go = (sid, fallback, o) => runDsh(T.text, sid, { fallback, ocSession: o, onEvent: run.event, chat, generation: gen, register: reg });
+      let cancelRefresh;
+      const cancelled = new Promise(resolve => { cancelRefresh = () => resolve(null); });
+      const waiting = { runId: 'quota-' + T.run.id, generation: gen, state: 'running', kind: 'chat',
+        interrupt: async () => { T.stop = true; waiting.hasClosed = true; guard.invalidate(); guard.unregister(); cancelRefresh(); run.end('interrupted', '额度刷新阶段已停止'); return true; } };
+      const guard = reg(waiting); T.cleanups.push(() => guard.unregister());
+      const quota = await Promise.race([dispatchSnapshot(), cancelled]);
+      guard.unregister();
+      if (!quota || T.stop) return;
+      const preferred = workerRoute(quota, reservations(quota));
+      const cd = preferred === 'deepseek' ? 2 : preferred === 'workbuddy' || coolingDown();
+      run.setRoute(cd === 2 ? 'deepseek' : cd ? 'workbuddy' : 'go');
+      emit('route.quota', { snapshotId: quota.id, route: cd === 2 ? 'deepseek' : cd ? 'workbuddy' : 'go' });
+      const go = (sid, fallback, o) => runDsh(T.text, sid, { fallback, ocSession: o, onEvent: run.event, chat, generation: gen, register: reg,
+        receiptIds: T.opts.receiptIds,
+        onSubmitted: ({ sessionId }) => { receipt(T.opts.receiptIds || [], 'accepted', { sessionId }); },
+        onDelivered: ({ sessionId }) => { receipt(T.opts.receiptIds || [], 'delivered', { sessionId }); },
+        onReceipt: (e) => app.notify('input-receipt', e),
+        onRequest: (q) => app.notify('worker-request', { ...q, msg: T.msg }), });
       const interrupted = (r) => {
         if (!(r.interrupted || r.stale)) return false;
         S.saveSessionIfAny(chat, r); log('dsh interrupted chat=' + chat);
@@ -92,9 +110,9 @@ export const corePlugin = {
         emit('route.fallback', { chat: tag(chat), quota });
         if (quota) {
           setGoCooldown(cfg.goCooldownMs);
-          await wx.replySoft(T.msg, '⚠️ Go 额度用完，接下来 ' + Math.round(cfg.goCooldownMs / 60000) + ' 分钟改走 DeepSeek 按量付费。');
+          await wx.replySoft(T.msg, '⚠️ Go 额度用完，接下来 ' + Math.round(cfg.goCooldownMs / 60000) + ' 分钟改走 WorkBuddy 线路。');
         }
-        run.note('Go 线路失败，改走 DeepSeek 按量重试'); run.setRoute('deepseek');
+        run.note('Go 线路失败，改走 WorkBuddy 线路重试'); run.setRoute('workbuddy');
         r = await go(T.sid, true, oc);
         if (interrupted(r)) return;
       }
@@ -104,6 +122,15 @@ export const corePlugin = {
         S.setSid(chat, null);
         run.note('旧会话丢了，开新会话重试');
         r = await go(null, cd, ocSession(chat, null));
+        if (interrupted(r)) return;
+      }
+      // 2026-09-30 第二层保险：第一层回落（WorkBuddy）也失败 → 付费 DeepSeek 官方兜底
+      if (cd !== 2 && noFinal(r) && !r.signal && !(T.sid && isSessionLost(r))) {
+        log('fallback FAILED chat=' + chat + ' err=' + r.errTail.replace(/\s+/g, ' ').slice(-300));
+        emit('route.fallback', { chat: tag(chat), quota: false, tier: 2 });
+        run.note('回落线路也失败，改用付费 DeepSeek 兜底重试');
+        run.setRoute('deepseek');
+        r = await go(T.sid, 2, oc);
         if (interrupted(r)) return;
       }
       T.r = r;
@@ -137,8 +164,8 @@ export const corePlugin = {
     app.stage('afterReply', 90, (T) => {
       const { r } = T;
       const ms = Date.now() - T.t0;
-      log('dsh reply sent chat=' + T.chat + ' len=' + T.out.length + ' files=' + T.files.length + ' route=' + (r.fallback ? 'deepseek' : 'go') + ' uncachedIn=' + r.usage + ' ctxPeak=' + r.usagePeak + ' took=' + (ms / 1000).toFixed(1) + 's sid=' + (r.sessionId || '-'));
-      emit('turn.done', { chat: tag(T.chat), ms, len: T.out.length, files: T.files.length, route: r.fallback ? 'deepseek' : 'go', ctx: r.usagePeak, steps: T.run.step, tools: T.run.tools, fresh: !!T.fresh, kind: T.kind || 'chat' });
+      log('dsh reply sent chat=' + T.chat + ' len=' + T.out.length + ' files=' + T.files.length + ' route=' + (r.fallback === 2 ? 'deepseek' : r.fallback ? 'workbuddy' : 'go') + ' uncachedIn=' + r.usage + ' ctxPeak=' + r.usagePeak + ' took=' + (ms / 1000).toFixed(1) + 's sid=' + (r.sessionId || '-'));
+      emit('turn.done', { chat: tag(T.chat), ms, len: T.out.length, files: T.files.length, route: r.fallback === 2 ? 'deepseek' : r.fallback ? 'workbuddy' : 'go', ctx: r.usagePeak, steps: T.run.step, tools: T.run.tools, fresh: !!T.fresh, kind: T.kind || 'chat' });
     });
 
     // reset（/new）：清掉前台会话
@@ -152,6 +179,7 @@ export const corePlugin = {
 // ---------- 对外：跑一轮、排队 ----------
 export function createAgent(app) {
   async function answer(msg, text, opts = {}) {
+    app.notify('chat-context', { chat: wx.chatKey(msg), msg });
     const T = { msg, chat: wx.chatKey(msg), text, spoken: text || '', opts, t0: Date.now(), routePrefix: '', forceRecall: false, injected: false, fresh: false, stop: false, cleanups: [], out: '', files: [] };
     emit('turn.start', { chat: tag(T.chat), route: !!opts.route, reask: !!opts.reask, steer: /^\[用户在你执行任务的过程中插话\]/.test(text || '') });
     try {
@@ -174,7 +202,7 @@ export function createAgent(app) {
   const chatOf = (msg) => wx.chatKey(msg);
   const agent = {
     answer,
-    enqueue: (msg, text, opts) => enqueue(chatOf(msg), () => answer(msg, text), opts),
+    enqueue: (msg, text, opts) => enqueue(chatOf(msg), () => answer(msg, text, opts || {}), opts),
     // 普通新消息：出队时先判定话题归属（前面排着的消息可能已经换了前台话题，所以必须出队时判）
     enqueueRouted: (msg, text) => enqueue(chatOf(msg), () => answer(msg, text, { route: true })),
     enqueueFn: (chat, fn, opts) => enqueue(chat, fn, opts),
@@ -184,7 +212,7 @@ export function createAgent(app) {
     }),
     busy: (chat) => !!activeRuns.get(chat) || live.runningFor(chat).length > 0,
     anyBusy: () => activeRuns.size > 0 || live.snapshot().running.length > 0,
-    queueBusy,
+    queueBusy, clearQueued,
     active: (chat) => activeRuns.get(chat),
     interrupt: interruptCurrentRun,
   };

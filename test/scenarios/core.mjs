@@ -89,7 +89,14 @@ export default [
       await env.say('坏任务 #fail');
       const t = await env.waitText('DSH 没返回内容');
       assert.match(t, /exit=1/);
-      assert.equal(env.dshCalls().length, 2);
+      // 2026-09-30 起是三层：Go → 第一层回落(WorkBuddy 免费) → 第二层保险(付费 DeepSeek)
+      const calls = env.dshCalls();
+      assert.equal(calls.length, 3);
+      assert.equal(calls[0].fallback, false);
+      assert.equal(calls[1].fallback, true);
+      assert.ok(calls[1].args.join(' ').includes('fallback-workbuddy'), '第一次回落走 WorkBuddy 免费线路');
+      assert.equal(calls[2].fallback, true);
+      assert.ok(calls[2].args.join(' ').includes('fallback-deepseek'), '第二次回落走付费 DeepSeek 兜底');
     },
   },
   {

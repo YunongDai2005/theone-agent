@@ -15,6 +15,7 @@ import * as signals from '../evolve/signals.mjs';
 import * as tunables from '../evolve/tunables.mjs';
 import * as proposals from '../evolve/proposals.mjs';
 import { runRetro, lastRetro } from '../evolve/retro.mjs';
+import { ago, short, pct, spanText } from '../observe/fmt.mjs';
 
 const STATUS = { proposed: '待批准', building: '外援实现中', ready: '测试通过·待上线', shipped: '已上线', rejected: '已否决', failed: '没做成', test_failed: '测试没过', merge_failed: '合并失败' };
 
@@ -47,6 +48,20 @@ export default {
 
     const notify = (t) => wx.notifyOwner(t).catch((e) => log('evolve notify ERROR ' + errText(e)));
 
+    // 「/看板 描述」：让工人按 docs/WIDGETS.md 给面板造一张卡片（在哪个模式都行）
+    app.command({
+      pattern: /^\/看板\s+([\s\S]{2,300})$/, names: ['/看板 描述'], help: '让工人给面板加一张卡片，如：/看板 显示知识库有多少条',
+      handle: (ctx, m) => {
+        emit('widget.request', { chat: tag(ctx.chat) });
+        wx.replySoft(ctx.msg, '🧩 好，交给工人做卡片，做好会告诉你放在哪一页。');
+        app.agent.enqueue(ctx.msg, '【给面板做一张卡片 — 主人的要求】' + m[1] + '\n做法严格按 /home/aibox/wx-router/docs/WIDGETS.md：优先 JSON 卡片（widget lint → widget add → widget board 看效果）；标题 ≤4 个字，一个重点，解释放 detailText。做完用一句话告诉主人放在哪一页、叫什么。');
+      },
+    });
+    app.command({ names: ['/看板'], help: '面板地址和每页有几张卡片', handle: async (ctx) => {
+      const W = await import('../observe/widgets.mjs');
+      const all = W.specs().widgets; const ps = W.pages();
+      wx.replySoft(ctx.msg, '🧩 面板：' + cfg.dashboardUrl + '\n' + ps.map((p) => p.title + ' ' + all.filter((w) => w.pages.includes(p.id)).length + ' 张').join(' · ') + '\n加卡片：/看板 想看什么');
+    } });
     app.command({ names: ['/进化', '进化'], help: '自进化：昨天的复盘、自动调参、改进提案', handle: (ctx) => wx.replySoft(ctx.msg, brief()) });
     app.command({
       names: ['/复盘'], help: '现在就复盘昨天（不写提案）',
@@ -97,5 +112,24 @@ export default {
       signals: signals.readDay(metrics.dayKey()).slice(-30).map((s) => ({ ts: s.ts, kind: s.kind })),
     }));
     app.status(() => { const n = proposals.list().filter((p) => p.status === 'proposed' || p.status === 'ready').length; return n ? '进化：' + n + ' 个提案等你处理（/进化）' : ''; });
+
+    app.badge('evolve', () => proposals.list().filter((p) => p.status === 'proposed' || p.status === 'ready').length || null);
+    // ---- 卡片 ----
+    const TONE = { proposed: 'violet', building: 'info', ready: 'good', shipped: 'good', rejected: 'mute', failed: 'bad', test_failed: 'bad', merge_failed: 'bad' };
+    app.widget({ id: 'evolve.levels', page: 'evolve', order: 1, size: 'xl', kind: 'chips', title: '怎么进化',
+      data: () => ({ items: [{ text: 'L0 观察 · 自动', tone: 'info' }, { text: 'L1 调参 · 自动', tone: 'good' }, { text: 'L2 改代码 · 你批准', tone: 'violet' }, { text: 'L3 安全/权限/花钱 · 永不', tone: 'bad' }] }),
+      detailText: '每晚 3 点复盘前一天。L1 只在护栏内微调参数，变差自动回滚。L2 写提案，你 /批准 才让外援在副本里做并跑测试，你 /上线 才合并重启。新功能上线时它也会给自己加一张看板卡片。' });
+    app.widget({ id: 'evolve.proposals', page: 'evolve', order: 2, size: 'l', kind: 'list', title: '提案', icon: '🧬',
+      data: () => ({ items: proposals.list().slice(-8).reverse().map((p) => ({ icon: '#' + Number(p.id), title: short(p.title, 22), sub: p.status === 'proposed' ? '/批准 ' + Number(p.id) : p.status === 'ready' ? '/上线 ' + Number(p.id) : ago(p.createdAt), badge: STATUS[p.status] || p.status, tone: TONE[p.status] || 'mute' })), empty: '没有提案，挺好' }),
+      detail: () => ({ sections: proposals.list().slice(-6).reverse().map((p) => ({ title: '#' + Number(p.id) + ' ' + p.title + ' · ' + (STATUS[p.status] || p.status), kind: 'kv', data: { items: [{ k: '问题', v: p.problem }, { k: '改法', v: p.change }, { k: '类型', v: ({ code: '改代码', prompt: '改话术', config: '改配置' }[p.kind] || p.kind) + ' · 风险' + p.risk }] } })) }) });
+    app.widget({ id: 'evolve.retro', page: 'evolve', order: 4, size: 'm', kind: 'kv', title: '昨晚复盘', icon: '📝',
+      data: () => { const r = lastRetro(); if (!r) return { items: [], empty: '今晚 3 点第一次复盘' }; const s = r.stats || {}, c = r.counts || {};
+        return { items: [{ k: '日期', v: r.day }, { k: '任务', v: (s.turns || 0) + ' 个' }, { k: '成功率', v: pct(s.successRate) }, { k: '一般要', v: s.p50 == null ? '–' : spanText(s.p50) }, { k: '不满意', v: ((c.complaint || 0) + (c.retry || 0) + (c.misroute || 0)) + ' 次' }] }; } });
+    app.widget({ id: 'evolve.tuning', page: 'evolve', order: 5, size: 'm', kind: 'rails', title: '自动调参', icon: '🎚',
+      data: () => ({ items: tunables.describe().map((t) => { const ms = /Ms$/.test(t.key); const f = (v) => (ms ? Math.round(v / 6000) / 10 + '分' : v);
+        return { label: ({ 'threadTh.switchSure': '话题切换', 'threadTh.newSure': '开新话题', progressEveryMs: '播报间隔', dshIdleMs: '卡死判定' })[t.key] || t.key, min: t.min, max: t.max, base: t.base, value: t.value, text: f(t.value), moved: t.value !== t.base }; }) }),
+      detailText: '竖线是你的原始设置，圆点是现在的值。发 /回滚调参 全部退回。' });
+    app.widget({ id: 'evolve.history', page: 'evolve', order: 6, size: 'm', kind: 'feed', title: '调整记录', mobile: 'hide',
+      data: () => ({ items: tunables.state().history.slice(-12).reverse().map((h) => ({ t: ago(h.at), icon: h.level === 'L1' ? '🔧' : '↩️', text: h.key === '*' ? '全部回滚' : short(h.key.split('.').pop() + ' ' + h.from + '→' + h.to, 30) })), empty: '还没自动调过' }) });
   },
 };

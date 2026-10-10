@@ -16,6 +16,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { quotaSnapshot, reservations } from '../core/quota-runtime.mjs';
+import { assess } from '../core/quota-policy.mjs';
+import { receipts, receipt } from './receipts.mjs';
 import { cfg, paths } from '../core/config.mjs';
 import { chat as llmChat, responses as llmResponses } from '../core/llm.mjs';
 
@@ -45,16 +48,18 @@ export function mailboxAdd(text, kind = 'note', binding = {}) {
   fs.appendFileSync(MAILBOX, JSON.stringify(item) + '\n');
   return item;
 }
-export function mailboxAll() { try { return fs.readFileSync(MAILBOX, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } }
-export function mailboxUnread() { return mailboxAll().filter((x) => !x.read); }
-export function mailboxMarkRead(ids) {
-  const all = mailboxAll(); const set = new Set(ids);
-  const keep = all.filter((x) => Date.parse(x.at) > Date.now() - 7 * 86400e3).map((x) => (set.has(x.id) ? { ...x, read: true, readAt: new Date().toISOString() } : x));
-  fs.writeFileSync(MAILBOX + '.tmp', keep.map((x) => JSON.stringify(x)).join('\n') + (keep.length ? '\n' : '')); fs.renameSync(MAILBOX + '.tmp', MAILBOX);
+export function mailboxAll() {
+  const states = receipts();
+  let rows = [];
+  try { rows = fs.readFileSync(MAILBOX, 'utf8').split('\n').filter(Boolean).flatMap(l => { try { return [JSON.parse(l)]; } catch { return []; } }); } catch {}
+  return rows.map(x => { const r = states.get(x.id); return { ...x, delivery: r?.state || (x.read ? 'delivered' : 'pending'), receipt: r || null, read: x.read || ['delivered', 'applied'].includes(r?.state) }; });
 }
+export function mailboxUnread() { return mailboxAll().filter(x => !x.read && x.delivery !== 'cancelled'); }
+export function mailboxMarkRead(ids) { receipt(ids, 'delivered', { via: 'mailbox' }); }
+export { receipt };
 
 // ---------- 工人提问 ----------
-export function pendingQuestion() { const q = rj(QFILE, null); return q && !q.answered ? q : null; }
+export function pendingQuestion(chat) { const q = rj(QFILE, null); return q && !q.answered && (!chat || !q.chat || q.chat === chat) ? q : null; }
 export function answerQuestion(q, text) { wj(AFILE, { qid: q.id, answer: text, at: new Date().toISOString() }); wj(QFILE, { ...q, answered: true }); }
 
 // ---------- 模型（统一走 core/llm.mjs）----------
@@ -84,16 +89,12 @@ reply 里说清你打算怎么办（比如"我转告它，拼接时加上"），
 
 // 三家顾问的额度（2026-09-28：主人要经理能看额度、判断用谁；自动派活用 helper start auto，也是经理的模型判断）
 export function quotaBrief() {
-  try {
-    const q = JSON.parse(fs.readFileSync(paths.quota, 'utf8'));
-    const w = (ws) => Object.entries(ws || {}).filter(([, x]) => x && x.usedPercent != null).map(([k, x]) => k + '剩' + Math.round(100 - x.usedPercent) + '%').join(' ') || '没有读数';
-    const adv = (a) => (a && a.calls != null ? '，约还能 ' + (a.atLeast ? '≥' : '') + a.calls + ' 次' : '');
-    return '\n\n【三家顾问额度】（' + Math.round((Date.now() - Date.parse(q.updatedAt)) / 60000) + ' 分钟前）' +
-      '\n- Claude（和主人共用）：' + w(q.claude && q.claude.windows) + adv(q.claude && q.claude.advisor) + (q.claude && q.claude.available === false ? '（限流中）' : '') +
-      '\n- GPT（ChatGPT Plus）：' + w(q.chatgpt && q.chatgpt.windows) + adv(q.chatgpt && q.chatgpt.advisor) + (q.chatgpt && q.chatgpt.limitReached ? '（已达上限）' : '') +
-      '\n- Go 包月：' + w(q.go && q.go.windows) + (q.go && q.go.pace ? '；本月节奏：应用 ' + q.go.pace.expected + '%、实际 ' + q.go.pace.used + '%' : '') + '（强模型按 4 倍扣）' +
-      '\n（主人问额度/用谁时照这个说；工人派外援用 helper start auto 会自动按额度选）';
-  } catch { return ''; }
+  const q = quotaSnapshot(), held = reservations(q);
+  return '\n\n【四路顾问额度，快照 ' + q.id + '】\n' + Object.values(q.providers).map(p => {
+    const a = assess(p, {}, held), u = a.urgent;
+    return '- ' + p.text + (p.observedAt ? '；实际核实于' + new Date(p.observedAt).toISOString() : '；无最新观测') +
+      (u ? '；' + u.minutes + '分钟后重置，优先交给它适合的已有任务' : '') + (!a.allowed ? '；派工暂停：' + a.reasons.join('、') : '');
+  }).join('\n') + '\n（派工用 helper start auto；所有适用窗口一起判断；未知不当满额。只能推进已授权待办，不为消耗额度编造任务。）';
 }
 
 // 工人状态 → 给经理看的一段文字
@@ -117,7 +118,7 @@ export function workerBrief(run, helpers) {
 export async function decide(ctx) {
   const t0 = Date.now();
   const hist = rj(HIST, {})[ctx.chat] || [];
-  const q = pendingQuestion();
+  const q = ctx.question || pendingQuestion(ctx.chat);
   const unread = mailboxUnread().filter((x) => !x.chat || (x.chat === ctx.chat && (!x.runId || x.runId === ctx.runId)));
   const status = workerBrief(ctx.run, ctx.helpers) + '\n\n【本轮已接受要求】\n' + cut(ctx.acceptedTask || ctx.run?.task, 6000) + quotaBrief() +
     (q ? '\n\n⚠️ 工人正在等主人回答它的提问：「' + cut(q.q, 200) + '」（' + mins(Date.now() - Date.parse(q.at)) + '前问的）' : '') +

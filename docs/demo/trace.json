@@ -174,8 +174,8 @@
     "quotas": [
       {
         "name": "Claude",
-        "left": 6,
-        "status": "Excluded: below 10%"
+        "left": 3,
+        "status": "Excluded: below reserve"
       },
       {
         "name": "GPT",

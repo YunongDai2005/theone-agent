@@ -79,7 +79,7 @@ export function saveHandoff({ title, keywords, reason = 'manual', body, sid = ''
     '- 讲了什么：' + oneLine(title, 60),
     '- 关键词：' + kw.join('、'),
   ];
-  if (sid) head.push('- 会话原文：~/.dsh/sessions/--home-aibox-dsh-work--/' + sid + '/');
+  if (sid) head.push('- 会话原文：~/.dsh/sessions/--home-ai-dsh-work--/' + sid + '/');
   if (fp) head.push('- 指纹：' + fp);
   const p = path.join(DIR, name);
   fs.writeFileSync(p, head.join('\n') + '\n\n' + String(body).trim() + '\n', { mode: 0o600 });

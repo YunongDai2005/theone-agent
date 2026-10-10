@@ -8,6 +8,7 @@
  *
  * 同一个场景可以分别跑 v2（src/main.mjs）和 v1（老 proxy.mjs，路径改写后原样运行），对比行为。
  */
+import { startService } from './fakes/service.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,9 +16,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-// Keep the test runner and gateway children on the same calendar day.
 process.env.TZ ||= 'UTC';
-
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const APP_DIR = path.resolve(HERE, '..');
 const V1_SRC = process.env.V1_SRC || APP_DIR;   // 老代码（proxy.mjs 等）就在仓库根目录，原样保留用于回滚
@@ -52,13 +51,15 @@ function startLlm(rules, calls) {
     let body = ''; for await (const c of req) body += c;
     let j = {}; try { j = JSON.parse(body); } catch {}
     const send = (o) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
+    // 记下用的是哪把钥匙 → 用来断言走的是哪条线路（test-wb=WorkBuddy / test-go=Go / test-ds=DeepSeek）
+    const auth = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     if (req.url.endsWith('/chat/completions')) {
       const msgs = j.messages || [];
       const sys = (msgs[0] && msgs[0].content) || '';
       const last = String((msgs.at(-1) || {}).content || '');
       let out;
-      if (sys.includes('你是主人的「经理」')) { const said = (last.match(/【主人说】([\s\S]*)$/) || [])[1] || last; out = await rules.manager(said.trim(), { sys, last }); calls.push({ kind: 'manager', said: said.trim(), out }); }
-      else { out = rules.judge(last); calls.push({ kind: 'judge-fast', out }); }
+      if (sys.includes('你是主人的「经理」')) { const said = (last.match(/【主人说】([\s\S]*)$/) || [])[1] || last; out = await rules.manager(said.trim(), { sys, last }); calls.push({ kind: 'manager', said: said.trim(), out, auth }); }
+      else { out = rules.judge(last); calls.push({ kind: 'judge-fast', out, auth }); }
       if (out === 'ERROR') { res.writeHead(500); res.end('{}'); return; }
       return send({ choices: [{ message: { content: JSON.stringify(out) } }] });
     }
@@ -91,14 +92,14 @@ function startIlink(queue, seen) {
  *   config    覆盖 config.json 的项
  *   setup(env)  网关启动前改文件（预置会话、交接目录、外援任务…）
  */
-export async function startEnv({ engine = 'v2', config = {}, setup, llmRules } = {}) {
+export async function startEnv({ engine = 'v2', config = {}, setup, llmRules, service = false } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'aibox-gw-'));
   const home = path.join(tmp, 'home');
   const root = path.join(home, 'wx-router');
   const files = { sent: path.join(tmp, 'sent.jsonl'), dsh: path.join(tmp, 'dsh.jsonl'), lost: path.join(tmp, 'lost.txt') };
   for (const d of [root, path.join(home, 'bin'), path.join(home, '.aibox/logs'), path.join(home, 'dsh-work/handoffs'), path.join(home, '.dsh')]) fs.mkdirSync(d, { recursive: true });
   fs.writeFileSync(files.sent, ''); fs.writeFileSync(files.dsh, ''); fs.writeFileSync(files.lost, '');
-  fs.writeFileSync(path.join(home, '.dsh/.credentials.yaml'), 'OPENCODE_GO_API_KEY: test-go\nDEEPSEEK_API_KEY: test-ds\n');
+  fs.writeFileSync(path.join(home, '.dsh/.credentials.yaml'), 'OPENCODE_GO_API_KEY: test-go\nWORKBUDDY_GATEWAY_API_KEY: test-wb\nDEEPSEEK_API_KEY: test-ds\n');
   cpDir(path.join(HERE, 'fakes/plugin'), path.join(home, PLUGIN_REL));
   fs.writeFileSync(path.join(home, 'bin/handoff-store.mjs'), fs.readFileSync(path.join(HERE, 'fixtures/handoff-store.mjs'), 'utf8').split('/home/aibox').join(home));   // 绝不碰真实的交接目录
 
@@ -113,16 +114,21 @@ export async function startEnv({ engine = 'v2', config = {}, setup, llmRules } =
   fs.writeFileSync(acctFile, JSON.stringify({ baseUrl: 'http://127.0.0.1:' + ilink.address().port, token: 'test-token' }));
   const dshBin = path.join(HERE, 'fakes/dsh.mjs');
   fs.chmodSync(dshBin, 0o755);
+  const native = service ? await startService() : null;
+  const secretFile = path.join(home, '.aibox/test-service-secret.json');
+  if (native) fs.writeFileSync(secretFile, JSON.stringify({ records: { 'client-connection/browser-session': { kind: 'grant', payload: { version: 1, secret: Buffer.alloc(32, 1).toString('base64url') } } } }));
   const cfg = {
     engine, listenHost: '127.0.0.1', listenPort: port, apiHost: '127.0.0.1', apiPort,
     accountFile: acctFile, realBase: 'http://127.0.0.1:' + ilink.address().port,
-    pluginDir: path.join(home, PLUGIN_REL), dshBin, dshCwd: path.join(home, 'dsh-work'), fallbackPatch: '/fake/fallback-deepseek.yml',
+    pluginDir: path.join(home, PLUGIN_REL), dshBin, dshCwd: path.join(home, 'dsh-work'),
+    fallbackPatch: '/fake/fallback-workbuddy.yml', fallbackPatch2: '/fake/fallback-deepseek.yml',
     dshTimeoutMs: 120000, dshIdleMs: 60000, dshWarnMs: 90000, dshContextBudget: 160000, handoffWarnPct: 0.85, handoffIdleMs: 8 * 3600e3,
     progressFirstMs: 600000, progressEveryMs: 600000, progressGapMs: 1000, slowNoticeMs: 600000,
     managerMode: true, mailboxPollMs: 500, steerMergeMs: 800, dashboardUrl: 'http://aibox.test/',
-    llm: { goBase: llmBase, deepseekBase: llmBase }, evolve: { retroHour: 99 },
+    llm: { goBase: llmBase, workbuddyBase: llmBase, deepseekBase: llmBase }, evolve: { retroHour: 99 },
     threadTh: { switchSure: 0.75, switchSureNoLex: 0.8, newSure: 0.75, newMaxCurLex: 1.01, newMinLen: 4, judgeIfCurBelow: 1.01, judgeIfOtherAbove: 0.1, cooldownBonus: 0.05 },
     ...config,
+    ...(native ? { dshTransport: 'service', dshService: { base: native.base, credentialsFile: secretFile, reconnectMs: 3000, questionMs: 3000 } } : {}),
   };
   fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify(cfg, null, 2));
 
@@ -136,7 +142,7 @@ export async function startEnv({ engine = 'v2', config = {}, setup, llmRules } =
   } else entry = path.join(APP_DIR, 'boot.mjs');
 
   const env = {
-    tmp, home, root, files, port, apiPort, cfg, engine, llmCalls, ilinkSeen, rules,
+    tmp, home, root, files, port, apiPort, cfg, engine, llmCalls, ilinkSeen, rules, native,
     proc: null, stderr: '', msgSeq: 0,
     file: (rel) => path.join(home, rel),
     readJson(rel, d = null) { try { return JSON.parse(fs.readFileSync(path.join(home, rel), 'utf8')); } catch { return d; } },
@@ -179,7 +185,7 @@ export async function startEnv({ engine = 'v2', config = {}, setup, llmRules } =
     api: async (name) => (await fetch('http://127.0.0.1:' + apiPort + '/api/v2/' + name)).json(),
     async stop() {
       if (env.proc && env.proc.exitCode == null) { env.proc.kill('SIGTERM'); await sleep(100); }
-      llm.close(); ilink.close();
+      llm.close(); ilink.close(); native?.stop();
       try { process.kill(-env.proc.pid, 'SIGKILL'); } catch {}
     },
     cleanup() { if (!process.env.KEEP_TMP) fs.rmSync(tmp, { recursive: true, force: true }); },

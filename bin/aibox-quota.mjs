@@ -5,14 +5,19 @@
  *   - OpenCode Go   GET https://opencode.ai/zen/go/v1/usage       → 5h/周/月 已用百分比 + 重置时间
  *   - ChatGPT 订阅  GET https://chatgpt.com/backend-api/wham/usage → 5h/周 已用百分比 + 重置时间
  *   - DeepSeek API  GET https://api.deepseek.com/user/balance      → 余额
+ *   - WorkBuddy     读网关状态文件 workbuddy-status.json           → 总额度/已用/剩余（pro 按量）
  *   - 本机统计      /home/aibox/wx-router/router.log                  → 今天 DSH 走 Go / DeepSeek 各几条
  * 由 systemd user timer `aibox-quota.timer` 每 5 分钟跑一次；手动：node /home/aibox/bin/aibox-quota.mjs
  */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseResetAt } from '/home/aibox/bin/claude-reset.mjs';
-import { estimate, load as loadLedger } from '/home/aibox/bin/helper-ledger.mjs';
+import { parseResetAt } from './claude-reset.mjs';
+import crypto from 'node:crypto';
+import { readBilling } from './workbuddy-quota.mjs';
+import { withLock } from '../wx-router/src/core/quota-runtime.mjs';
+import { stamp, windowView } from '../wx-router/src/core/quota-policy.mjs';
+import { estimate, load as loadLedger } from './helper-ledger.mjs';
 
 const OUT_DIR = '/home/aibox/.aibox';
 const OUT = path.join(OUT_DIR, 'quota.json');
@@ -35,7 +40,7 @@ const iso = (sec) => (sec ? new Date(sec * 1000).toISOString() : null);
 
 async function go() {
   const key = credRef('OPENCODE_GO_API_KEY');
-  if (!key) return { ok: false, error: '没有配置 key' };
+  if (!key) return { ok: false, configured: false, error: '没有配置 key' };
   const j = await getJson('https://opencode.ai/zen/go/v1/usage', {
     Authorization: 'Bearer ' + key, 'x-opencode-session': 'ses_aibox_quota', 'User-Agent': 'aibox-quota/1.0 (ai-box)',
   });
@@ -101,8 +106,8 @@ function claudeLocal() {
     const resetMs = Date.parse(resetsAt || '');
     if (Number.isFinite(resetMs)) {
       if (now >= resetMs) {
-        return { ...base, available: true, limited: false, resetsAt,
-                 note: '已过恢复时间，额度应已重置（下次调用确认）' };
+        return { ...base, available: null, limited: null, resetsAt,
+                 note: '已到恢复时间，待下一次调用确认' };
       }
       return { ...base, available: false, limited: true, resetsAt };
     }
@@ -129,7 +134,7 @@ async function claude() {
   const tokFile = path.join(os.homedir(), '.config/claude-code/oauth-token');
   let tok = '';
   try { tok = fs.readFileSync(tokFile, 'utf8').trim(); } catch {}
-  if (!tok) return { ok: false, error: '没有配置 oauth-token' };
+  if (!tok) return { ok: false, configured: false, error: '没有配置 oauth-token' };
   const local = claudeLocal();
   // 2026-09-28：% 从哪来 —— 官方额度端点要 user:profile 权限（我们的令牌没有），但 Claude Code 每次调用的
   // stream-json 里都带 rate_limit_event（5 小时/每周已用比例 + 重置时间）。ask-claude 把它记进外援账本，这里取最新一次。
@@ -142,19 +147,55 @@ async function claude() {
       const x = s[k]; if (!x) continue;
       const resetsAt = x.r ? new Date(x.r * 1000).toISOString() : null;
       const passed = resetsAt && Date.parse(resetsAt) <= Date.now();
-      windows[label] = { usedPercent: passed ? null : x.u, resetsAt: passed ? null : resetsAt, reset: !!passed };
+      windows[label] = { usedPercent: passed ? null : x.u, resetsAt, reset: !!passed };
     }
   }
   const cur = {};
   if (windows['5小时'] && windows['5小时'].usedPercent != null) cur['5h'] = { usedPercent: windows['5小时'].usedPercent, label: '5小时' };
   if (windows['每周'] && windows['每周'].usedPercent != null) cur['7d'] = { usedPercent: windows['每周'].usedPercent, label: '每周' };
   return { ...local, windows, asOf: last ? new Date(last.end || last.t).toISOString() : null, advisor: estimate('claude', cur),
+           observedAt: last ? new Date(last.end || last.t).toISOString() : local.lastOkAt || local.detectedAt || null,
            source: last ? 'Claude Code 调用时附带的额度信息' : '还没有带额度信息的调用记录' };
+}
+
+// WorkBuddy（腾讯 CodeBuddy，经本地网关反代）：额度由网关自己写状态文件，读它即可。
+// 只读到 30 天周期的总额度/已用，没有 5h/周这种滚动窗口 —— 所以卡片上画一根条。
+const WB_STATUS = '/home/aibox/.local/share/workbuddy-gateway/workbuddy-status.json';
+async function workbuddy() {
+  let d;
+  try { d = JSON.parse(fs.readFileSync(WB_STATUS, 'utf8')); } catch { return { ok: false, error: '读不到网关状态文件' }; }
+  const a = (d.accounts || [])[0];
+  if (!a) return { ok: false, error: '网关里没有账号' };
+  if (!a.quotaKnown || a.quotaTotal == null) return { ok: false, error: '网关还没取到额度' };
+  let bill = null; try { bill = await readBilling('/home/aibox/.local/share/workbuddy-gateway/workbuddy.json'); } catch {}
+  const total = bill?.quotaTotal ?? Number(a.quotaTotal), used = bill?.quotaUsed ?? (Number(a.quotaUsed) || 0);
+  let cycles = {}; try { cycles = JSON.parse(fs.readFileSync(path.join(OUT_DIR, 'quota-cycles.json'), 'utf8')); } catch {}
+  const cycle = cycles.workbuddy || {};
+  const resetAt = bill?.resetsAt || a.quotaResetsAt || a.quotaResetAt || a.billingPeriodEnd || cycle.resetsAt || null;
+  const usedPercent = total > 0 ? Math.round((used / total) * 1000) / 10 : null;
+  return {
+    ok: true,
+    available: a.state === 'active',
+    plan: a.planLabel || null,
+    paid: !!a.isPaidUser,
+    usedPercent,
+    quotaTotal: total,
+    quotaUsed: Math.round(used * 100) / 100,
+    quotaRemaining: Math.round((bill?.quotaRemaining ?? (Number(a.quotaRemaining) || 0)) * 100) / 100,
+    buckets: bill?.buckets || [],
+    observedAt: bill?.observedAt || (a.quotaCheckedAt ? new Date(a.quotaCheckedAt * 1000).toISOString() : null),
+    expirationAt: iso(a.tokenExpiresAt),
+    // 月额度按套餐周期刷新；令牌有效期不是额度重置日。优先读上游明确字段，其次读已确认周期配置。
+    cycle: 'monthly', resetSource: resetAt ? '已确认套餐周期' : '月刷新日期待确认',
+    windows: usedPercent == null ? {} : { '每月': { usedPercent, status: a.state === 'active' ? 'ok' : 'limited', resetsAt: resetAt, expiringPercent: bill?.expiringPercent ?? null } },
+    asOf: d.updatedAt ? new Date(d.updatedAt * 1000).toISOString() : null,
+    source: bill?.source || 'WorkBuddy 网关缓存（上游观测时间未知）',
+  };
 }
 
 async function deepseek() {
   const key = credRef('DEEPSEEK_API_KEY');
-  if (!key) return { ok: false, error: '没有配置 key' };
+  if (!key) return { ok: false, configured: false, error: '没有配置 key' };
   const j = await getJson('https://api.deepseek.com/user/balance', { Authorization: 'Bearer ' + key });
   const b = (j.balance_infos || []).filter((x) => Number(x.total_balance) > 0);
   const main = b[0] || (j.balance_infos || [])[0] || {};
@@ -176,17 +217,29 @@ function todayRoutes() {
   return out;
 }
 
-async function safe(fn) { try { return await fn(); } catch (e) { return { ok: false, error: String((e && e.message) || e).slice(0, 120) }; } }
+async function safe(fn, local = false) {
+  const fetchedAt = new Date().toISOString();
+  try {
+    const r = await fn();
+    return { ...r, fetchedAt, observedAt: 'observedAt' in r ? r.observedAt : local ? r.asOf || null : r.ok ? new Date().toISOString() : null };
+  } catch (e) { return { ok: false, fetchedAt, observedAt: null, error: String((e && e.message) || e).slice(0, 120) }; }
+}
 
+const requestedAt = Date.now();
+await withLock('quota-collect', async () => {
+try { if (stamp(JSON.parse(fs.readFileSync(OUT, 'utf8')).updatedAt) >= requestedAt) return; } catch {}
+const [g, c, cl, wb, ds] = await Promise.all([safe(go), safe(chatgpt), safe(claude, true), safe(workbuddy, true), safe(deepseek)]);
 const result = {
-  updatedAt: new Date().toISOString(),
-  go: await safe(go),
-  chatgpt: await safe(chatgpt),
-  claude: await safe(claude),
-  deepseek: await safe(deepseek),
-  today: todayRoutes(),
+  snapshotId: crypto.randomUUID(), updatedAt: new Date().toISOString(),
+  go: g, chatgpt: c, claude: cl, workbuddy: wb, deepseek: ds, today: todayRoutes(),
 };
 fs.mkdirSync(OUT_DIR, { recursive: true });
+// A failed refresh must not erase a previously known exhaustion. Keep the old source timestamp.
+let previous = {}; try { previous = JSON.parse(fs.readFileSync(OUT, 'utf8')); } catch {}
+for (const id of ['go', 'chatgpt', 'workbuddy']) {
+  const old = previous[id], current = result[id];
+  if (!current.ok && old?.windows) result[id] = { ...old, ...current, observedAt: 'observedAt' in old ? old.observedAt : 'asOf' in old ? old.asOf : old.ok ? previous.updatedAt : null, windows: old.windows, available: old.available, limited: old.limited, limitReached: old.limitReached, cachedAfterFailure: true };
+}
 
 // ---------- 历史采样 + 预测用完时间 ----------
 const HIST = path.join(OUT_DIR, 'quota-history.jsonl');
@@ -223,11 +276,11 @@ const GO_STATE = '/home/aibox/wx-router/go-state.json';
 let gs = {};
 try { gs = JSON.parse(fs.readFileSync(GO_STATE, 'utf8')); } catch {}
 if (result.go && result.go.ok) {
-  const full = Object.values(result.go.windows).filter((w) => w && (w.usedPercent >= 100 || (w.status && w.status !== 'ok')));
+  const full = Object.values(result.go.windows).filter((w) => w && windowView(w)?.blocked);
   if (full.length) {
     const until = Math.max(...full.map((w) => Date.parse(w.resetsAt) || now + 3600e3));
     if (!(gs.cooldownUntil > until - 60e3)) { gs = { cooldownUntil: until, at: new Date().toISOString(), source: 'quota' }; fs.writeFileSync(GO_STATE, JSON.stringify(gs, null, 2)); }
-  } else if (gs.source === 'quota' && gs.cooldownUntil > now) {
+  } else if (gs.source === 'quota' && Object.values(result.go.windows).filter(Boolean).every(w => !windowView(w)?.pending && w.usedPercent != null)) {
     gs = {}; fs.writeFileSync(GO_STATE, '{}\n'); // 我们设的冷却，Go 已恢复 → 解除
   }
 }
@@ -273,3 +326,4 @@ fs.writeFileSync(OUT + '.tmp', JSON.stringify(result, null, 2));
 fs.chmodSync(OUT + '.tmp', 0o644);
 fs.renameSync(OUT + '.tmp', OUT);
 if (process.argv.includes('--print')) console.log(JSON.stringify(result, null, 2));
+});

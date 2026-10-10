@@ -73,7 +73,7 @@ t('信号：抱怨、嫌吵、重发、停后又让继续', () => {
 t('打码：密码/令牌不进信号样本', () => {
   assert.equal(mask('密码是 hunter2abc'), '密码是 hunter2abc'.replace('hunter2abc', 'hunter2abc'));   // 没有 "密码:" 形式的不误伤
   assert.match(mask('password: hunter2'), /password: \*\*\*/);
-  assert.match(mask('token sk_live_ABCDEF1234567890XYZ'), /\*\*\*/); // gitleaks:allow -- synthetic redaction test fixture, not a credential
+  assert.match(mask('token sk_live_ABCDEF1234567890XYZ'), /\*\*\*/);
 });
 
 t('提案：新增 / 列表 / 否决', () => {

@@ -6,6 +6,7 @@
  *   GET /api/v2/describe  插件/命令/流水线挂点一览（给人和 AI 看网关的结构）
  *   其它插件用 app.api() 注册的：topics、helpers、manager、evolve …
  */
+import { serviceState } from '../agent/service-runner.mjs';
 import http from 'node:http';
 import { execFileSync } from 'node:child_process';
 import { cfg, APP_DIR } from '../core/config.mjs';
@@ -14,6 +15,7 @@ import * as metrics from '../observe/metrics.mjs';
 import * as live from '../observe/live.mjs';
 import { allQueues } from '../agent/queue.mjs';
 import { routeLabel, goCooldownUntil } from '../agent/dsh.mjs';
+import * as W from '../observe/widgets.mjs';
 
 const startedAt = Date.now();
 let version = 'dev';
@@ -29,14 +31,18 @@ export default {
     });
 
     app.api('status', () => ({
-      engine: 'v2', version, pid: process.pid, startedAt, uptimeMs: Date.now() - startedAt, node: process.version,
+      engine: 'v2', dshService: serviceState(), version, pid: process.pid, startedAt, uptimeMs: Date.now() - startedAt, node: process.version,
       route: routeLabel(), goCooldownUntil: goCooldownUntil(),
       plugins: app.plugins, live: live.snapshot(), queues: allQueues().map((q) => ({ ...q, chat: tag(q.chat) })),
       config: { dshContextBudget: cfg.dshContextBudget, dshIdleMs: cfg.dshIdleMs, dshTimeoutMs: cfg.dshTimeoutMs, handoffWarnPct: cfg.handoffWarnPct, managerMode: cfg.managerMode, tunables: cfg._tunables },
     }));
     app.api('metrics', (q) => ({ today: metrics.today(), days: metrics.lastDays(Math.min(60, Number(q.get('days')) || 7)) }));
     app.api('events', (q) => recentEvents(Number(q.get('since')) || 0, Math.min(500, Number(q.get('limit')) || 200)));
-    app.api('describe', () => app.describe());
+    app.api('describe', () => ({ ...app.describe(), widgets: W.specs().widgets.map((w) => w.id + '@' + w.pages.join('/') + ' (' + (w.plugin || w.file) + ')'), pluginsWithoutWidgets: W.coverage(app) }));
+    // 面板（积木式）：一页的卡片 + 数据；点开详情；卡片定义和 JSON 卡片校验
+    app.api('board', (q) => W.board(app, q.get('page') || 'home'));
+    app.api('detail', (q) => W.detail(app, q.get('id')));
+    app.api('widgets', () => W.specs());
 
     if (!cfg.apiPort) return;
     const srv = http.createServer(async (req, res) => {

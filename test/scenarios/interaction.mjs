@@ -5,10 +5,11 @@ import path from 'node:path';
 
 const dsh = async (env) => { await env.say('/dsh'); await env.waitText('已切换'); };
 const busy = async (env, task = '长任务 #sleep=4000') => {
-  const callsBefore = env.dshCalls().length;
+  const n = env.dshCalls().length;
   await env.say(task);
+  await env.waitFor(() => env.dshCalls().length > n, { what: '假 DSH 真的开始跑' });
   await env.waitFor(() => (env.readJson('wx-router/dsh-live.json', { running: [] }).running || []).length, { what: '工人开始干活' });
-  await env.waitCalls(callsBefore + 1);
+  await new Promise((r) => setTimeout(r, 300));
 };
 
 export default [
@@ -122,11 +123,24 @@ export default [
       await dsh(env);
       await busy(env, '长任务 #sleep=2500');
       await env.say('顺便把结果做成表格');
-      await env.waitText('🧑‍💼 好，我转告它');
+      await env.waitText(env.engine === 'v1' ? '🧑‍💼 好，我转告它' : '已放入信箱');
       await env.waitText('ECHO:长任务', { timeout: 10000 });
       await env.waitFor(() => env.dshCalls().find((c) => c.task.includes('【你刚才干活时主人说的话')), { timeout: 20000, what: '信箱补交' });
       const c = env.dshCalls().find((x) => x.task.includes('【你刚才干活时主人说的话'));
       assert.match(c.task, /顺便把结果做成表格/);
+    },
+  },
+  {
+    name: '经理走免费线路：WorkBuddy 网关优先',
+    async run(env) {
+      await dsh(env);
+      await busy(env, '长任务 #sleep=2500');
+      await env.say('顺便记一下');
+      await env.waitText(env.engine === 'v1' ? '🧑‍💼 好，我转告它' : '已放入信箱');
+      await env.waitFor(() => env.llmCalls.some((c) => c.kind === 'manager'), { timeout: 20000, what: '经理调用模型' });
+      const m = env.llmCalls.filter((c) => c.kind === 'manager');
+      // 2026-09-30：经理/裁判优先走本地 WorkBuddy 网关（免费），挂了才退 Go / 付费 DeepSeek
+      assert.equal(m[0].auth, 'test-wb', '经理第一条就应走 WorkBuddy（钥匙=test-wb）');
     },
   },
   {

@@ -16,6 +16,7 @@ import * as signals from './signals.mjs';
 import * as tunables from './tunables.mjs';
 import * as proposals from './proposals.mjs';
 import { responses } from '../core/llm.mjs';
+import * as W from '../observe/widgets.mjs';
 
 const pctTxt = (x) => (x == null ? '—' : Math.round(x * 100) + '%');
 const secTxt = (ms) => (ms == null ? '—' : Math.round(ms / 1000) + ' 秒');
@@ -87,10 +88,14 @@ const PROPOSAL_PROMPT = (g, arch) => `你是一个 AI 网关的"自进化复盘�
 - 不许提：改安全规则、删数据、花钱、动凭证、关掉叫停功能、扩大工人权限。
 - 数据参数（阈值/间隔）已有自动调参，除非需要超出护栏，否则不要重复提。
 - 每条提案必须能用网关的回放测试（test/）验证。
+- 面板是积木式的（docs/WIDGETS.md）：功能没有面板卡片、或卡片坏了，也算值得提的问题（kind=widget），改法写清楚放哪页、什么类型、显示什么。
 - 没有明确问题就返回空数组，不要硬凑。
 
 网关结构（插件与挂点）：
 ${JSON.stringify(arch).slice(0, 3000)}
+
+还没有面板卡片的功能：${JSON.stringify(g.noWidget || [])}
+坏掉的 JSON 卡片：${JSON.stringify(g.badWidgets || [])}
 
 昨天的数据：
 ${JSON.stringify(g.s)}
@@ -99,11 +104,12 @@ ${JSON.stringify(g.s)}
 信号样本：
 ${g.sig.filter((x) => x.text).slice(-25).map((x) => '- [' + x.kind + '] ' + x.text).join('\n') || '（无）'}
 
-只输出 JSON：{"proposals":[{"title":"≤30字","problem":"看到了什么问题（引用数据/样本）","change":"具体改哪个插件/文件、怎么改","kind":"code|prompt|config","risk":"低|中|高","verify":"怎么验证有效","expected":"预期效果"}]}`;
+只输出 JSON：{"proposals":[{"title":"≤30字","problem":"看到了什么问题（引用数据/样本）","change":"具体改哪个插件/文件、怎么改","kind":"code|prompt|config|widget","risk":"低|中|高","verify":"怎么验证有效","expected":"预期效果"}]}`;
 
 export async function runRetro(app, { day = metrics.dayKey(Date.now() - 86400e3), llm = true } = {}) {
   metrics.flush();
   const g = gather(day);
+  try { g.noWidget = app ? W.coverage(app).filter((n) => !['observe', 'recall', 'stop', 'steer', 'progress'].includes(n)) : []; g.badWidgets = W.specs().errors.map((e) => e.file); } catch { g.noWidget = []; g.badWidgets = []; }
   // L1：先看上次调参后是不是变差了，变差就回滚；否则按规则调
   let rolled = null, changes = [];
   if (cfg.evolve.autoTune) {
@@ -124,7 +130,7 @@ export async function runRetro(app, { day = metrics.dayKey(Date.now() - 86400e3)
   // L2：信号够多才花钱请模型写提案
   let props = [];
   const totalSignals = Object.values(g.counts).reduce((a, b) => a + b, 0);
-  if (llm && cfg.evolve.proposals && totalSignals >= cfg.evolve.proposalMinSignals) {
+  if (llm && cfg.evolve.proposals && (totalSignals >= cfg.evolve.proposalMinSignals || (g.noWidget || []).length || (g.badWidgets || []).length)) {
     try {
       const txt = await responses(cfg.llm.judgeModel || 'gpt-6-luna', PROPOSAL_PROMPT(g, app ? app.describe() : {}), { session: 'ses_aibox_evolve', maxTokens: 4000, effort: 'medium', timeoutMs: 180000, purpose: 'evolve' });
       const a = txt.indexOf('{'), b = txt.lastIndexOf('}');

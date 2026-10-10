@@ -22,13 +22,14 @@ export default {
         return 'consume';
       }
       app.notify('preempt', { chat });
+      app.notify('worker-stop', { chat }); app.agent.clearQueued(chat);
       (async () => {
         const ok = await app.agent.interrupt(chat, a.runId);
         log('interrupt ' + (ok ? 'done' : 'noop') + ' chat=' + chat + ' run=' + a.runId.slice(0, 8));
         emit('stop.done', { chat: tag(chat), ok, voice: !ctx.t });
         await wx.replySoft(msg, ok
           ? '⛔ 停了。\n（当前这轮已中断，做到哪没保留；发「继续」我接着做，/new 重新开始。）'
-          : 'ℹ️ 这轮刚好已经结束了，没需要停的。');
+          : (a.hasClosed ? 'ℹ️ 这轮刚好已经结束了，没需要停的。' : '已请求停止，但还没确认任务退出。'));
       })().catch((e) => log('interrupt ERROR ' + errText(e)));
       return 'consume';
     });

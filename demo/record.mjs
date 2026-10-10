@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import { snapshot, assess, prioritize, describe } from '../src/core/quota-policy.mjs';
 import { startEnv, OWNER } from '../test/harness.mjs';
 
 const scenario = [
@@ -63,27 +64,29 @@ const start = helper.indexOf('function quotaView()');
 const end = helper.indexOf('// ---------- 状态 / 展示 ----------', start);
 assert.ok(start >= 0 && end > start, 'Selection section must exist');
 const selectionCode = helper.slice(start, end);
+// Fixture quota (shape of ~/.aibox/quota.json). Readings are marked as just observed so the
+// real policy treats them as fresh; none of these numbers are written to the trace.
 const quota = {
-  updatedAt: '2026-01-01T00:00:00Z',
-  claude: { ok: true, windows: { fiveHour: { usedPercent: 94 } } },
-  chatgpt: { ok: true, windows: { fiveHour: { usedPercent: 28 } } },
-  go: { ok: true, windows: { monthly: { usedPercent: 45 } } },
+  updatedAt: new Date().toISOString(),
+  claude: { ok: true, windows: { '5小时': { usedPercent: 97 } } },
+  chatgpt: { ok: true, windows: { '5小时': { usedPercent: 28 } } },
+  go: { ok: true, windows: { '每月': { usedPercent: 45 } } },
 };
 let modelCalls = 0;
 const context = vm.createContext({
-  rj: () => quota,
-  fs: { readFileSync: () => 'OPENCODE_GO_API_KEY: demo-fixture-only' },
-  cut: (s, n) => String(s).slice(0, n), log: () => {}, AbortSignal,
-  fetch: async (_url, options) => {
+  // Real quota policy (filters, reserves, priority); fixture snapshot; no locks, files or network.
+  dispatchSnapshot: async () => snapshot(quota), quotaSnapshot: () => snapshot(quota), reservations: () => [],
+  assess, prioritize, describe, wbUp: () => false,
+  cut: (s, n) => String(s).slice(0, n), log: () => {},
+  selectChat: async (messages) => {
     modelCalls++;
-    const body = JSON.parse(options.body);
-    const text = body.messages[1].content;
+    const text = messages[1].content;
     const candidates = text.split('【候选】\n')[1];
-    assert.ok(!candidates.includes('Claude'), 'Below 10% remaining must be excluded');
+    assert.ok(!candidates.includes('Claude'), 'A provider below its reserve must be excluded');
     assert.match(text, /72%/); assert.match(text, /55%/);
     const match = candidates.match(/^(\d+)\. GPT /m);
     assert.ok(match);
-    return { json: async () => ({ choices: [{ message: { content: JSON.stringify({ pick: Number(match[1]), effort: 'high', reason: 'Fixture decision: coding task; GPT has 72% remaining.' }) } }] }) };
+    return { text: JSON.stringify({ pick: Number(match[1]), suitable: [Number(match[1])], effort: 'high', reason: 'Fixture decision: coding task; GPT has 72% remaining.' }) };
   },
 });
 const advisor = await new vm.Script(selectionCode + '\nchoose("Review the Python CSV implementation", {work:true, hard:true})').runInContext(context);
@@ -92,7 +95,7 @@ const result = {
   schema: 1,
   provenance: { gateway: 'Real v2 routing and session code', model: 'Deterministic fixture responses', worker: 'Fake DSH, no actual project edits', advisor: 'Real quota filter and selection functions; simulated Manager choice', execution: 'Sequential per chat; no concurrent-task or task-bound-mailbox claim' },
   frames,
-  advisor: { task: 'Review the Python CSV implementation', quotas: [{name:'Claude',left:6,status:'Excluded: below 10%'},{name:'GPT',left:72,status:'Selected by fixture Manager'},{name:'Go',left:55,status:'Eligible alternative'}], selected: 'GPT', reason: 'Coding task; 72% remaining. Manager choice is simulated.', verified: true },
+  advisor: { task: 'Review the Python CSV implementation', quotas: [{name:'Claude',left:3,status:'Excluded: below reserve'},{name:'GPT',left:72,status:'Selected by fixture Manager'},{name:'Go',left:55,status:'Eligible alternative'}], selected: 'GPT', reason: 'Coding task; 72% remaining. Manager choice is simulated.', verified: true },
   checks: ['Three distinct sessions created', 'All three follow-ups reuse the original worker session ID', 'The final follow-up stays in the Python session', 'Advisor below 10% is excluded before Manager selection', 'Manager receives quota data and task requirements'],
 };
 const out = new URL('../docs/demo/trace.json', import.meta.url);

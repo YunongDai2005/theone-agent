@@ -3,6 +3,7 @@
  *   dsh-live.json（仪表盘「DSH 正在做什么」读它）+ 给微信进度播报用的摘要。
  * 2026-09-27 Mac 端 Claude 写。只记说明文字、工具名和描述，不记工具输出内容。
  */
+import { mask } from '../core/log.mjs';
 import fs from 'node:fs';
 import { paths } from '../core/config.mjs';
 
@@ -14,7 +15,7 @@ const MILESTONE_RE = /【进展】\s*(.+)/g;
 const state = { running: {}, recent: [] };
 let nextId = 1, timer = null;
 
-export const cut = (s, n) => { s = String(s ?? '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n) + '…' : s; };
+export const cut = (s, n) => { s = mask(s).replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n) + '…' : s; };
 export const dur = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? s + ' 秒' : s < 3600 ? Math.floor(s / 60) + ' 分 ' + (s % 60) + ' 秒' : Math.floor(s / 3600) + ' 小时 ' + Math.floor((s % 3600) / 60) + ' 分'; };
 
 function flush() {
@@ -35,16 +36,17 @@ export function init() {
   try {
     const j = JSON.parse(fs.readFileSync(FILE, 'utf8'));
     const lost = (j.running || []).map((r) => ({ ...r, status: 'interrupted', endedAt: j.updatedAt, current: null }));
-    state.recent = [...lost, ...(j.recent || [])].slice(0, KEEP_RECENT);
+    const redact = x => typeof x === 'string' ? mask(x) : Array.isArray(x) ? x.map(redact) : x && typeof x === 'object' ? Object.fromEntries(Object.entries(x).map(([k, v]) => [k, redact(v)])) : x;
+    state.recent = redact([...lost, ...(j.recent || [])].slice(0, KEEP_RECENT));
   } catch {}
   save(true);
 }
 
-const isClaudeCall = (tool, i) => tool === 'bash' && /ask-claude|ask-go|helper(\.mjs)? start (claude|gpt|go)\b/.test((i && i.command) || '');
+const isClaudeCall = (tool, i) => tool === 'bash' && /ask-claude|ask-go|helper(\.mjs)? start (claude|gpt|go|wb|auto)\b/.test((i && i.command) || '');
 function toolLabel(tool, input) {
   const i = input || {};
   if (tool === 'codex' || tool === 'codex_max') return '请 GPT 外援：' + cut(i.prompt || i.task || i.description || '', 80);
-  if (isClaudeCall(tool, i)) return '请 ' + (/start gpt/.test(i.command) ? 'GPT' : /start go\b|ask-go/.test(i.command) ? 'Go 顾问' : 'Claude') + ' 外援' + (/--work/.test(i.command) ? '（干活）' : '（顾问）') + '：' + cut(i.description || i.command, 80);
+  if (isClaudeCall(tool, i)) return '请 ' + (/start wb/.test(i.command) ? 'WorkBuddy 顾问' : /start auto/.test(i.command) ? '自动顾问' : /start gpt/.test(i.command) ? 'Codex' : /start go\b|ask-go/.test(i.command) ? 'Go 顾问' : 'Claude') + ' 外援' + (/--work/.test(i.command) ? '（干活）' : '（顾问）') + '：' + cut(i.description || i.command, 80);
   const main = i.description || i.command || i.path || i.file_path || i.filePath || i.url || i.query || i.pattern || i.prompt;
   return tool + (main ? '：' + cut(main, 100) : '');
 }
@@ -84,7 +86,9 @@ export function startRun({ chat, kind = 'chat', task = '', limitMs = 0, idleMs =
       run.current = { kind: 'think', label: '思考中', since: Date.now() };
     } else if (j.type === 'status' && j.phase === 'step_end' && j.usage) {
       const it = (j.usage.inputTokens || 0) + (j.usage.cacheReadTokens || 0) + (j.usage.cacheWriteTokens || 0);
-      if (it > run.ctx) run.ctx = it;    } else if (j.type === 'text' && j.text && j.text.trim()) {
+      if (it > run.ctx) run.ctx = it;    } else if (j.type === 'waiting') {
+      run.current = { kind: 'wait', label: j.label || '等你回答', since: Date.now() };
+    } else if (j.type === 'text' && j.text && j.text.trim()) {
       const plain = String(j.text).replace(/【进展】.*/g, '').trim(); // 进展单独展示，"刚才说"里不重复
       if (plain) run.lastSay = cut(plain, 400);
       push({ k: 'say', x: cut(j.text, 300) });

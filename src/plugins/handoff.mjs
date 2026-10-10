@@ -13,6 +13,8 @@ import * as wx from '../channel/wechat.mjs';
 import * as S from '../agent/session.mjs';
 import { runDsh, noFinal, coolingDown, ocSession } from '../agent/dsh.mjs';
 import { registerActiveRun, beginGeneration } from '../agent/runs.mjs';
+import * as live from '../observe/live.mjs';
+import { ago, short } from '../observe/fmt.mjs';
 
 // 交接包字段 = agent-session-harness 的 capsule + Zylos 要点 + project-handoff 五段式；只给要点和路径，不贴长文
 export const HANDOFF_PROMPT = `请把当前整个会话压缩成一份"交接包"，只输出 JSON 对象本身，不要任何解释文字，不要 Markdown 代码块围栏。
@@ -159,13 +161,18 @@ export default {
       if (T.injected && !noFinal(T.r)) { S.clearPendingHandoff(T.chat); log('handoff consumed chat=' + T.chat); emit('handoff.consumed', { chat: tag(T.chat) }); }
     });
 
-    // afterRun@30：上下文水位（本轮单步输入峰值 ≈ 当前上下文规模）；到 warnPct 提醒一次
+    // afterRun@30：上下文水位（= 本轮【最后一个 step】的输入 = 对话历史实际有多长）。
+    // 不用 usagePeak：那是"最重的一步"，turn 里工具调用越多它越高，会把长任务误判成上下文满。
+    // 同一会话内取"见过的最大值"（单调）：短 turn 不该把水位拉低。
     app.stage('afterRun', 30, async (T) => {
       const { r, chat } = T;
-      if (!(r.sessionId && r.usagePeak > 0)) return;
-      const e = S.patchMeta(chat, { ctxIn: r.usagePeak });
+      const fill = r.ctxFill > 0 ? r.ctxFill : r.usagePeak;
+      if (!(r.sessionId && fill > 0)) return;
+      const prev = (S.getMeta(chat) || {}).ctxIn || 0;
+      const ctx = Math.max(r.sessionId === (S.getMeta(chat) || {}).ctxSid ? prev : 0, fill);
+      const e = S.patchMeta(chat, { ctxIn: ctx, ctxSid: r.sessionId });
       const pct = e.ctxIn / cfg.dshContextBudget;
-      T.run.setCtx({ ctx: r.usagePeak, budget: cfg.dshContextBudget, warnPct: cfg.handoffWarnPct });
+      T.run.setCtx({ ctx: e.ctxIn, budget: cfg.dshContextBudget, warnPct: cfg.handoffWarnPct });
       if (!e.handoffWarned && pct >= cfg.handoffWarnPct) {
         S.patchMeta(chat, { handoffWarned: true });
         await wx.replySoft(T.msg, '⚠️ 这个会话上下文用到 ' + Math.round(pct * 100) + '% 了。到 ' + Math.round(cfg.handoffSwitchPct * 100) + '% 我会自动开新会话，要点自动交接，不丢进度。');
@@ -177,5 +184,21 @@ export default {
       if (!m || !m.ctxIn) return '';
       return '上下文：' + Math.round((m.ctxIn / cfg.dshContextBudget) * 100) + '%（到 ' + Math.round(cfg.handoffSwitchPct * 100) + '% 自动交接）';
     });
+
+    // ---- 卡片 ----
+    app.widget({ id: 'ctx', page: ['home', 'worker'], order: 12, size: 's', kind: 'ring', title: '上下文', icon: '🧠',
+      data() {
+        const s = live.snapshot(); const r = (s.running[0] && s.running[0].ctx ? s.running[0] : null) || s.recent.find((x) => x.ctx);
+        if (!r || !r.ctx) return { pct: 0, sub: '还没读数', tone: 'mute' };
+        const p = r.ctx / (r.ctxBudget || cfg.dshContextBudget), w = r.ctxWarnPct || cfg.handoffWarnPct;
+        return { pct: p, sub: Math.round(r.ctx / 1000) + 'k / ' + Math.round((r.ctxBudget || cfg.dshContextBudget) / 1000) + 'k', tone: p >= 1 ? 'bad' : p >= w ? 'warn' : 'good' };
+      },
+      detailText: '工人的"短期记忆"用了多少。到 100% 会自动开新会话，把要点写成交接包带过去，不丢进度。' });
+    app.widget({ id: 'memory.handoffs', page: 'memory', order: 20, size: 'm', kind: 'list', title: '交接存档', icon: '🗂',
+      data() {
+        let rows = [];
+        try { rows = fs.readFileSync(path.join(handoffDir(), 'INDEX.md'), 'utf8').split('\n').filter((l) => /^\| \d{4} /.test(l)); } catch {}
+        return { items: rows.slice(-6).reverse().map((l) => { const c = l.split('|').map((x) => x.trim()); return { icon: '📄', title: short(c[3], 22), sub: c[2] }; }), empty: '还没有交接' };
+      } });
   },
 };

@@ -8,6 +8,37 @@ const ymd = (ts) => { const d = new Date(ts); return d.getFullYear() + '-' + Str
 
 export default [
   {
+    name: '额度刷新等待期间叫停：不启动工人', v1: false,
+    async setup(env) {
+      const script = env.file('bin/aibox-quota.mjs');
+      fs.writeFileSync(script, `await new Promise(r=>setTimeout(r,4000));`);
+    },
+    async run(env) {
+      await dsh(env); await env.say('任务等待刷新');
+      await env.waitFor(() => (env.readJson('wx-router/dsh-live.json', {running:[]}).running || []).length, {what:'开始等待额度'});
+      await new Promise(r=>setTimeout(r,100));
+      await env.say('停'); await env.waitText('⛔ 停了'); await env.idle();
+      assert.equal(env.dshCalls().length,0,'停止后不能启动模型');
+    },
+  },
+  {
+    name: '额度面板与路由：过期不是100%，快照一致', v1: false,
+    async setup(env) {
+      env.writeJson('.aibox/quota.json', {snapshotId:'q-test',updatedAt:new Date().toISOString(),go:{ok:true,observedAt:new Date().toISOString(),windows:{'5小时':{usedPercent:99,resetsAt:new Date(Date.now()-1000).toISOString()}}},claude:{ok:true,asOf:null,windows:{'5小时':{usedPercent:null,reset:true}}}});
+    },
+    async run(env) {
+      const q=await env.api('quota');
+      assert.equal(q.snapshotId,'q-test');
+      assert.equal(q.providers.find(p=>p.id==='go').state,'pending_reset');
+      const board=await env.api('board?page=home');
+      const card=board.widgets.find(w=>w.id==='quota');
+      assert.equal(card.data.snapshotId,q.snapshotId);
+      const go=card.data.items.find(i=>i.label==='Go');
+      assert.equal(go.windows[0].left,null);assert.equal(go.windows[0].text,'—');
+      assert.equal(go.windows[0].resetAt,null);
+    },
+  },
+  {
     name: '/帮助 列出所有命令', v1: false,
     async run(env) {
       await env.say('/帮助');

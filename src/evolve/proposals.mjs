@@ -32,7 +32,7 @@ export function add(p) {
   const id = pad(n);
   const clean = {
     id, status: 'proposed', createdAt: Date.now(), day: p.day,
-    title: cut(p.title, 40), problem: cut(p.problem, 400), change: cut(p.change, 600), kind: ['code', 'prompt', 'config'].includes(p.kind) ? p.kind : 'code',
+    title: cut(p.title, 40), problem: cut(p.problem, 400), change: cut(p.change, 600), kind: ['code', 'prompt', 'config', 'widget'].includes(p.kind) ? p.kind : 'code',
     risk: ['低', '中', '高'].includes(p.risk) ? p.risk : '中', verify: cut(p.verify, 300), expected: cut(p.expected, 200), evidence: p.evidence || {},
     history: [{ at: Date.now(), status: 'proposed' }],
   };
@@ -64,9 +64,10 @@ ${p.verify}
 ## 要求
 1. 先读 README.md 和 docs/ARCHITECTURE.md，按插件结构改；能在插件里改就别动核心（src/core、src/agent）。
 2. 改完必须跑 \`node test/run.mjs\`，全部通过；给这个改动补一个回放测试场景（test/scenarios/）。
-3. 不许：改安全规则（stop-rules）、扩大工人权限、删数据、动凭证、改 config.json 里主人的设置。
-4. 不要 merge、不要重启服务 —— 主人会在微信里用 /上线 ${Number(p.id)} 决定。
-5. 最后用 3~5 句话总结改了什么、测试结果。
+3. 如果加了新功能（或这条提案本身就是做面板卡片），按 docs/WIDGETS.md 给它做一张面板卡片（插件里 app.widget，或 JSON 卡片），标题 ≤4 个字、一个重点。
+4. 不许：改安全规则（stop-rules）、扩大工人权限、删数据、动凭证、改 config.json 里主人的设置。
+5. 不要 merge、不要重启服务 —— 主人会在微信里用 /上线 ${Number(p.id)} 决定。
+6. 最后用 3~5 句话总结改了什么、测试结果、卡片放在哪一页。
 `;
 }
 

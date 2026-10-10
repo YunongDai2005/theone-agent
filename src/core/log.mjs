@@ -26,6 +26,7 @@ export const cut = (s, n) => { s = String(s ?? '').replace(/\s+/g, ' ').trim(); 
 // 打码：长得像密钥/令牌/密码的串（≥16 位字母数字混合，或 key=/token=/password= 后面的值）
 export function mask(s) {
   return String(s ?? '')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '***')
     .replace(/((?:pass(?:word)?|pwd|token|secret|key|密码|口令)\s*[:：=]\s*)\S+/gi, '$1***')
     .replace(/\b(?=[A-Za-z0-9_\-]{16,}\b)(?=[^\s]*\d)(?=[^\s]*[A-Za-z])[A-Za-z0-9_\-]{16,}\b/g, '***');
 }

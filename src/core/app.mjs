@@ -7,6 +7,7 @@
  *   status(fn)                                /mode 回执和面板 API 里的状态行
  *   every(ms, fn)                             定时任务
  *   api(path, fn)                             面板 API（GET /api/v2/<path>）
+ *   widget(spec)                              面板卡片（见 observe/widgets.mjs、docs/WIDGETS.md）—— 新功能顺手带一张
  *   listen(name, fn) / notify(name, data)     插件之间的进程内通知（如 'new' = 主人发了 /new）
  *
  * 流水线阶段（按顺序）：
@@ -14,6 +15,7 @@
  *   任一阶段把 turn.stop 置 true，后面的阶段都不再跑（例如被叫停）。
  */
 import { log, errText, emit } from './log.mjs';
+import * as W from '../observe/widgets.mjs';
 
 export const STAGES = ['input', 'turnStart', 'route', 'session', 'context', 'run', 'afterRun', 'deliver', 'afterReply', 'reset'];
 
@@ -64,6 +66,8 @@ export function createApp(cfg) {
       app.timers.push(t);
     },
     api(p, fn) { app.apis.set(p, fn); },
+    widget(spec) { W.register(spec, app._cur); },
+    badge(page, fn) { W.badge(page, fn); },
     // 进程内通知（带完整数据，不落盘；落盘的用 emit）
     listen(name, fn) { (app._hooks[name] ||= []).push(fn); },
     notify(name, data) { for (const fn of app._hooks[name] || []) { try { fn(data); } catch (e) { log('hook ERROR ' + name + ' ' + errText(e)); } } },

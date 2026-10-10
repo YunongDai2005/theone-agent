@@ -18,7 +18,7 @@ export default {
 
     function report(chat) {
       const on = mgr.isOn(chat, cfg.managerMode);
-      const q = mgr.pendingQuestion();
+      const q = app.workerQuestion?.(chat) || mgr.pendingQuestion(chat);
       return (on ? '🧑‍💼 经理在岗' : '经理下班中') + '\n' +
         (app.agent.busy(chat) ? '工人正在干活，现在跟你说话的是经理。' : '工人空闲，你的话直接给工人。') + '\n' +
         '信箱未读 ' + mgr.mailboxUnread().length + ' 条' + (q ? '；工人在等你回答：「' + q.q.slice(0, 60) + '」' : '') + '\n' +
@@ -38,11 +38,12 @@ export default {
 
     const decisions = new Map();
     const epochs = new Map();
+    app.listen('worker-stop', ({ chat }) => { const ids = mgr.mailboxUnread().filter(x => x.chat === chat).map(x => x.id); mgr.receipt(ids, 'cancelled', { via: 'owner-stop' }); });
     app.listen('preempt', ({ chat }) => epochs.set(chat, (epochs.get(chat) || 0) + 1));
     app.listen('new', ({ chat }) => epochs.set(chat, (epochs.get(chat) || 0) + 1));
 
     async function handle(msg, chat, text, target, run, epoch) {
-      const d = await mgr.decide({ chat, text, run, runId: target?.runId, acceptedTask: target?.task, helpers: helperBrief() });
+      const d = await mgr.decide({ chat, text, run, runId: target?.runId, acceptedTask: target?.task, helpers: helperBrief(), question: app.workerQuestion?.(chat) });
       emit('manager.decide', { chat: tag(chat), action: d.action, ms: d.ms, route: d.route });
       if ((epochs.get(chat) || 0) !== epoch) {
         await wx.replySoft(msg, '🧑‍💼 刚才那轮执行状态已经变化，这条要求尚未应用：' + text + '\n请确认要调整哪项任务。');
@@ -61,14 +62,25 @@ export default {
         await wx.replySoft(msg, '🧑‍💼 刚才那轮执行状态已经变化，这条要求尚未应用：' + text + '\n请确认要调整哪项任务。');
         return;
       }
-      if (!['redo', 'stop', 'note'].includes(d.action)) await wx.replySoft(msg, '🧑‍💼 ' + d.reply);
-      if (d.action === 'note') { mgr.mailboxAdd(tw, 'note', { chat, runId: target.runId, topicId: app.threads?.summary(chat)?.fg?.id || null }); await wx.replySoft(msg, '🧑‍💼 好，我转告它。这是可继续执行的补充，已放入信箱。'); }
-      else if (d.action === 'answer' && d.question) mgr.answerQuestion(d.question, tw);
+      if (!['redo', 'stop', 'note', 'answer'].includes(d.action)) await wx.replySoft(msg, '🧑‍💼 ' + d.reply);
+      if (d.action === 'note') {
+        const item = mgr.mailboxAdd(tw, 'note', { chat, runId: target.runId, topicId: app.threads?.summary(chat)?.fg?.id || null });
+        await wx.replySoft(msg, target.steer ? '收到补充，正在转交给它。' : '收到补充，已放入信箱，等工人接收。');
+        if (target.steer) {
+          try { await target.steer(item); }
+          catch { if (!mgr.mailboxAll().find(x => x.id === item.id)?.read) await wx.replySoft(msg, '补充已保存，但尚未确认接入当前任务；结束后会补交。'); }
+        }
+      }
+      else if (d.action === 'answer' && d.question) {
+        if (d.question.native) await app.answerWorkerQuestion({ chat, msg }, text);
+        else { mgr.answerQuestion(d.question, tw); await wx.replySoft(msg, '回答已转交给工人。'); }
+      }
       else if (d.action === 'queue') app.agent.enqueueRouted(msg, tw);
       else if (d.action === 'split') { if (app.topics) app.topics.split(msg, chat); }
       else if (d.action === 'stop') {
         if (target.kind !== 'chat') { await wx.replySoft(msg, '🧑‍💼 当前在写交接，暂时无法安全打断。'); return; }
         app.notify('preempt', { chat });
+        app.notify('worker-stop', { chat }); app.agent.clearQueued(chat);
         const ok = await app.agent.interrupt(chat, target.runId);
         await wx.replySoft(msg, ok && target.hasClosed ? '🧑‍💼 当前执行已停止。已完成的操作仍然保留。' : '🧑‍💼 已请求停止，但尚未确认进程退出。');
       } else if (d.action === 'redo') {
@@ -85,8 +97,7 @@ export default {
           if (!await stopped || (epochs.get(chat) || 0) !== revisionEpoch) return;
           const notes = mgr.mailboxUnread().filter(x => x.chat === chat && x.runId === target.runId);
           const original = (target.task || run?.task || '') + (notes.length ? '\n【此前尚未读取的补充】\n' + notes.map(x => x.text).join('\n') : '');
-          if (notes.length) mgr.mailboxMarkRead(notes.map(x => x.id));
-          await app.agent.answer(msg, managerRevision(original, tw), { raw: true });
+          await app.agent.answer(msg, managerRevision(original, tw), { raw: true, receiptIds: notes.map(x => x.id) });
         }, { priority: true });
         let ok = false;
         try { ok = await app.agent.interrupt(chat, target.runId); }
@@ -115,23 +126,34 @@ export default {
     });
 
     // 工人这一轮结束了、信箱里还有没看的留言 → 作为下一条消息交给它（保证不丢）
+    const queuedReceipts = new Set();
     app.every(cfg.mailboxPollMs, () => {
       const unread = mgr.mailboxUnread();
       if (!unread.length) return;
       for (const [chat, msg] of lastDshMsg) {
         if (app.agent.busy(chat) || app.agent.queueBusy(chat)) continue;
         const topicId = app.threads?.summary(chat)?.fg?.id || null;
-        const scoped = unread.filter((x) => !x.chat || (x.chat === chat && (!x.topicId || x.topicId === topicId)));
+        const scoped = unread.filter((x) => !queuedReceipts.has(x.id) && (!x.chat || (x.chat === chat && (!x.topicId || x.topicId === topicId))));
         if (!scoped.length) continue;
-        mgr.mailboxMarkRead(scoped.map((x) => x.id));
+        for (const x of scoped) queuedReceipts.add(x.id);
         log('mailbox deliver chat=' + chat + ' n=' + scoped.length);
         emit('mailbox.deliver', { chat: tag(chat), n: scoped.length });
-        app.agent.enqueue(msg, mailboxDelivery(scoped.map((x) => '- ' + x.text).join('\n')));
+        const ids = scoped.map(x => x.id);
+        app.agent.enqueue(msg, mailboxDelivery(scoped.map((x) => '- [' + x.id + '] ' + x.text).join('\n')), { receiptIds: ids })
+          .finally(() => ids.forEach(id => queuedReceipts.delete(id)));
         break;
       }
     });
 
     app.stage('afterReply', 30, (T) => { try { mgr.noteWorkerReply(T.chat, T.out); } catch (e) { log('manager noteWorkerReply ERROR ' + errText(e)); } });
+    app.api('deliveries', () => mgr.mailboxAll().slice(-30).map(x => ({ id: x.id, at: x.at, state: x.delivery, chat: tag(x.chat) })));
+    app.widget({ id: 'worker.delivery', page: 'worker', order: 25, size: 'm', kind: 'list', title: '补充',
+      data: () => { const rows = mgr.mailboxAll().slice(-5); return { items: rows.map(x => ({ title: '#' + x.id, sub: { pending: '已接收，等待转交', accepted: '已送入会话，等待接入', delivered: '工人已接入', applied: '工人确认已处理', cancelled: '随叫停取消' }[x.delivery], tone: x.read ? 'good' : 'warn' })) }; } });
     app.api('manager', () => ({ unread: mgr.mailboxUnread().length, question: mgr.pendingQuestion() ? { q: String(mgr.pendingQuestion().q).slice(0, 120), at: mgr.pendingQuestion().at } : null }));
+
+    app.widget({ id: 'worker.manager', page: 'worker', order: 3, size: 's', kind: 'stat', title: '经理', icon: '🧑‍💼',
+      data: () => { const q = mgr.pendingQuestion(), n = mgr.mailboxUnread().length;
+        return q ? { value: '有问题', tone: 'warn', sub: '工人在等你回答' } : { value: n, unit: '条未读', sub: mgr.isOn('', cfg.managerMode) ? '在岗' : '下班', tone: n ? 'info' : '' }; },
+      detailText: '工人干活时你说的话先给经理，它秒回、决定转达还是打断。/经理开 /经理关 开关。' });
   },
 };

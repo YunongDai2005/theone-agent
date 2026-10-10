@@ -10,7 +10,7 @@
 import argparse, glob, json, os, subprocess, sys, time
 
 BASE = os.path.expanduser('~/.dsh/sessions')
-DEFAULT_DIR = os.path.join(BASE, '--home-aibox-dsh-work--')
+DEFAULT_DIR = os.path.join(BASE, '--home-ai-dsh-work--')
 
 
 def load(sess_dir):

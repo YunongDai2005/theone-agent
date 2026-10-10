@@ -13,6 +13,8 @@ import * as S from '../agent/session.mjs';
 import * as live from '../observe/live.mjs';
 import { createRouter, misrouteClaim } from '../memory/threads.mjs';
 import { makeTopicJudge } from '../manager/core.mjs';
+import * as metrics from '../observe/metrics.mjs';
+import { ago, short } from '../observe/fmt.mjs';
 
 const MISROUTE_NOFIND_NOTE = '【系统提示 — 主人看不到这段，别在回复里提】主人说话题放错了/串了，但系统没找到更合适的旧会话。' +
   '请结合上下文和交接目录判断他想接的是哪件事，直接按那件事回答；实在对不上再用一句话简单确认。\n\n';
@@ -146,5 +148,17 @@ export default {
       if (c.interrupted) app.agent.interrupt(chat, a.runId).then((ok) => log('misroute interrupt ' + (ok ? 'done' : 'noop') + ' chat=' + chat)).catch((e) => log('misroute ERROR ' + errText(e)));
       return 'consume';
     });
+
+    // ---- 卡片 ----
+    app.widget({ id: 'memory.topics', page: 'memory', order: 1, size: 'l', kind: 'list', title: '话题', icon: '🧵',
+      data() {
+        const st = threads._load(); const items = [];
+        for (const c of Object.values(st.chats || {})) for (const t of Object.values(c.threads || {}).filter((x) => x.status === 'open').sort((a, b) => b.lastActiveAt - a.lastActiveAt).slice(0, 10))
+          items.push({ icon: t.id === c.fg ? '▶️' : '💬', title: short(t.title, 20), sub: ago(t.lastActiveAt), badge: t.id === c.fg ? '当前' : '', tone: 'info' });
+        return { items, empty: '聊几句就有了' };
+      },
+      detailText: '一个聊天框背后按话题分成几个会话，聊回旧事会自动接上那件事的记忆。说「切错了」撤回；/new 开新话题；/拆话题 把聊混的拆开。' });
+    app.widget({ id: 'memory.switch', page: 'memory', order: 2, size: 's', kind: 'stat', title: '今天切换', icon: '🔀',
+      data: () => { const t = metrics.today() || {}; return { value: t.topicSwitches || 0, unit: '次', sub: t.misroutes ? '切错 ' + t.misroutes : '没切错', tone: t.misroutes ? 'warn' : '' }; } });
   },
 };

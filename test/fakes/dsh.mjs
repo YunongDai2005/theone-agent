@@ -7,6 +7,7 @@
  *   #fail         直接失败、没有 final
  *   #milestone=X  输出一行【进展】X
  *   #usage=N      报告单步输入 N token
+ *   #steps=a,b,c  按顺序报告每个 step 的输入 token（用来验证"水位取最后一步、不是峰值"）
  *   #send=路径     回复里带 [[发送:路径]]
  *   #final=X      回复 X（默认 ECHO:<用户原话>）
  * 每次调用记一行到 FAKE_DSH_LOG；FAKE_LOST 文件里列出的 sid 视为"会话不存在"。
@@ -31,7 +32,7 @@ try { lost = fs.readFileSync(process.env.FAKE_LOST, 'utf8').split('\n').filter(B
 if (sid && lost.includes(sid)) { process.stderr.write('Error: session ' + sid + ' does not exist; omit --session-id to start a new one\n'); process.exit(1); }
 
 const d = {};
-for (const m of task.matchAll(/#(sleep|hang|quota|fail|milestone|usage|send|final)(?:=([^\s#]*))?/g)) d[m[1]] = m[2] ?? true;
+for (const m of task.matchAll(/#(sleep|hang|quota|fail|milestone|usage|steps|send|final)(?:=([^\s#]*))?/g)) d[m[1]] = m[2] ?? true;
 if (d.quota && !fallback) { process.stderr.write('HTTP 429 RATE_LIMIT exceeded\n'); process.exit(1); }
 if (d.fail) { process.stderr.write('boom\n'); process.exit(1); }
 
@@ -48,7 +49,16 @@ while (Date.now() < until) {
   await sleep(Math.min(300, Math.max(0, until - Date.now())));
   out({ type: 'tool_result', callId, status: 'completed' });
 }
-out({ type: 'status', phase: 'step_end', usage: { inputTokens: Number(d.usage || 1000), cacheReadTokens: 0 } });
+// 多个 step 的单步输入：能验证「水位 = 最后一步」而不是「峰值」
+if (d.steps) {
+  const seq = String(d.steps).split(',').map((x) => Number(x) || 0);
+  for (const v of seq) {
+    out({ type: 'status', phase: 'step_start' });
+    out({ type: 'status', phase: 'step_end', usage: { inputTokens: v, cacheReadTokens: 0 } });
+  }
+} else {
+  out({ type: 'status', phase: 'step_end', usage: { inputTokens: Number(d.usage || 1000), cacheReadTokens: 0 } });
+}
 
 let final;
 if (task.startsWith('请把当前整个会话压缩成一份"交接包"')) final = JSON.stringify({ title: '测试交接-' + id.slice(-4), keywords: ['测试', 'handoff'], task: '继续测试', next_action: '跑下一个场景' });

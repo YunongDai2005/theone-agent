@@ -19,10 +19,17 @@ function owner() {
   return null;
 }
 
-let text = process.argv.slice(2).join(' ');
-if (!text || text === '-') text = fs.readFileSync(0, 'utf8');
-text = text.trim();
-if (!text) { console.error('usage: wx-notify.mjs "text"'); process.exit(2); }
+const argv = process.argv.slice(2);
+// --file <路径> 可多次：发文件/图片（2026-09-30 加，之前只支持纯文本，
+// 导致卫星出图脚本调了也没东西发出去）
+const files = [];
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '--file') { if (argv[i + 1]) files.push(argv[i + 1]); i++; }
+}
+let text = argv.filter((a, i) => !(a === '--file' || (i > 0 && argv[i - 1] === '--file'))).join(' ');
+if (!text || text === '-') text = files.length ? '' : fs.readFileSync(0, 'utf8');
+text = (text || '').trim();
+if (!text && !files.length) { console.error('usage: wx-notify.mjs "text" | --file <path> ["text"]'); process.exit(2); }
 const to = owner();
 if (!to) { console.error('wx-notify: 找不到收件人'); process.exit(3); }
 
@@ -32,6 +39,14 @@ const opts = { baseUrl: ((cfg.realBase && cfg.realBase.trim()) || a.baseUrl).rep
 opts[k] = a[k];
 const { sendMessageWeixin } = await import(path.join(PLUGIN, 'messaging/send.js'));
 const LIMIT = 1800;
-for (let i = 0; i < text.length; i += LIMIT) await sendMessageWeixin({ to, text: text.slice(i, i + LIMIT), opts });
-try { fs.appendFileSync(path.join(ROUTER, 'router.log'), '[' + new Date().toISOString() + '] wx-notify sent len=' + text.length + '\n'); } catch {}
+if (text) for (let i = 0; i < text.length; i += LIMIT) await sendMessageWeixin({ to, text: text.slice(i, i + LIMIT), opts });
+
+if (files.length) {
+  const { sendWeixinMediaFile } = await import(path.join(PLUGIN, 'messaging/send-media.js'));
+  for (const f of files) {
+    if (!fs.existsSync(f)) { console.error('wx-notify: 文件不存在 ' + f); continue; }
+    await sendWeixinMediaFile({ filePath: f, to, text: '', opts, cdnBaseUrl: cfg.cdnBaseUrl });
+  }
+}
+try { fs.appendFileSync(path.join(ROUTER, 'router.log'), '[' + new Date().toISOString() + '] wx-notify sent len=' + text.length + ' files=' + files.length + '\n'); } catch {}
 console.log('sent');

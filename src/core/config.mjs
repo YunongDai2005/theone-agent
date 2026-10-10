@@ -54,13 +54,20 @@ export const DEFAULTS = {
   localTimeoutMs: 180000,
   dshBin: '/usr/local/bin/dsh',
   dshCwd: path.join(HOME, 'dsh-work'),
-  fallbackPatch: path.join(HOME, '.dsh/profiles/headless/fallback-deepseek.yml'),
+  // 2026-09-30 两层回落：第一层 = 本地 WorkBuddy 网关（免费）；第二层 = 付费 DeepSeek 官方兜底
+  fallbackPatch: path.join(HOME, '.dsh/profiles/headless/fallback-workbuddy.yml'),
+  fallbackPatch2: path.join(HOME, '.dsh/profiles/headless/fallback-deepseek.yml'),
+  dshTransport: 'headless',
+  dshService: { base: 'http://127.0.0.1:3081', reconnectMs: 30000, questionMs: 1800000,
+    routes: { go: { provider: 'opencode-go', model: 'deepseek-v4.1-flash' }, workbuddy: { provider: 'workbuddy-local', model: 'deepseek-v4.1-flash' }, deepseek: { provider: 'deepseek-official', model: 'deepseek-flash' } } },
   dshTimeoutMs: 3600000,
   dshIdleMs: 720000,
   dshWarnMs: 2700000,
   goCooldownMs: 3600000,
   slowNoticeMs: 20000,
-  dshContextBudget: 45000,
+  // 上下文预算 = 换会话的水位线。模型真实窗口 1M（见 ~/.dsh/profiles/headless/cordis.patch.yml），
+  // 480k = 48%，给输出(64k)和历史增长留足余量。原 160k 只占 16%，换会话过于频繁（2026-09-30 主人反馈）。
+  dshContextBudget: 480000,
   handoffMinMsgs: 3,
   handoffTimeoutMs: 300000,
   handoffMaxChars: 6000,
@@ -82,8 +89,10 @@ export const DEFAULTS = {
   threadRouterShadow: false,
   threadTh: {},
   dashboardUrl: 'http://127.0.0.1/',
+  systemStatusUrl: 'http://127.0.0.1/api/status',   // 面板后端的机器状态（系统卡片用）
   llm: {
     goBase: 'https://opencode.ai/zen/go/v1',
+    workbuddyBase: 'http://127.0.0.1:8317/v1',
     deepseekBase: 'https://api.deepseek.com',
     managerModel: 'deepseek-v4.1-flash',
     deepseekModel: 'deepseek-flash',
@@ -91,8 +100,9 @@ export const DEFAULTS = {
   },
   // 功能开关：每个插件一个，false = 不加载（等于把这块功能拔掉）
   features: {
-    progress: true, manager: true, topics: true, stop: true, steer: true,
+    board: true, system: true, progress: true, manager: true, topics: true, stop: true, steer: true,
     handoff: true, recall: true, helpers: true, local: true, observe: true, evolve: true,
+    transcript: false, sdr: false,   // 公开版默认关：聊天转录涉及隐私、SDR 依赖特定硬件，需要时在 config.json 打开
   },
   evolve: {
     retroHour: 3,            // 每天几点做复盘（在 4 点日切之前）
@@ -128,6 +138,7 @@ export function validate(c) {
     if (typeof v !== type) { errs.push(p + ' 应该是 ' + type + '，现在是 ' + JSON.stringify(v)); continue; }
     if (type === 'number' && ((min != null && v < min) || (max != null && v > max))) errs.push(p + '=' + v + ' 超出范围 [' + min + ', ' + max + ']');
   }
+  if (!['headless', 'service'].includes(c.dshTransport)) errs.push('dshTransport 应为 headless 或 service');
   if (c.dshWarnMs >= c.dshTimeoutMs) errs.push('dshWarnMs 应该小于 dshTimeoutMs');
   if (!isObj(c.features)) errs.push('features 应该是对象');
   return errs;

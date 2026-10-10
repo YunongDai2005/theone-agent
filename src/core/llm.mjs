@@ -6,6 +6,8 @@
  */
 import fs from 'node:fs';
 import { cfg, paths } from './config.mjs';
+import { quotaSnapshot, reservations } from './quota-runtime.mjs';
+import { assess } from './quota-policy.mjs';
 import { emit } from './log.mjs';
 
 const cut = (s, n) => { s = String(s || '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n) + '…' : s; };
@@ -20,10 +22,16 @@ export function key(name) {
 
 function routes(session) {
   const L = cfg.llm;
-  return [
+  const list = [
+    // 2026-09-30 本地 WorkBuddy 网关（月套餐，实测 1.7s）默认优先；挂了再退 Go 订阅 / DeepSeek 按量
+    { name: 'workbuddy', url: L.workbuddyBase + '/chat/completions', model: L.managerModel, key: 'WORKBUDDY_GATEWAY_API_KEY', extra: { thinking: { type: 'disabled' } }, headers: {} },
     { name: 'go', url: L.goBase + '/chat/completions', model: L.managerModel, key: 'OPENCODE_GO_API_KEY', extra: { thinking: { type: 'disabled' } }, headers: { 'x-opencode-session': session } },
     { name: 'deepseek', url: L.deepseekBase + '/chat/completions', model: L.deepseekModel, key: 'DEEPSEEK_API_KEY', extra: { thinking: { type: 'disabled' } }, headers: {} },
   ];
+  const q = quotaSnapshot(), held = reservations(q);
+  const subscription = list.slice(0,2).map(r => ({...r,quota:assess(q.providers[r.name==='workbuddy'?'wb':'go'],{model:r.model,quick:true},held)})).filter(r=>r.quota.allowed);
+  subscription.sort((a,b)=>(b.quota.urgent?.score || 0)-(a.quota.urgent?.score || 0));
+  return [...subscription,list[2]];
 }
 
 export async function chat(messages, { session = 'ses_aibox_manager', maxTokens = 700, json = true, timeoutMs = 20000, purpose = 'manager' } = {}) {
@@ -52,6 +60,8 @@ export async function chat(messages, { session = 'ses_aibox_manager', maxTokens 
 
 export async function responses(model, input, { session = 'ses_aibox_topicjudge', maxTokens = 1500, effort = 'low', timeoutMs = 45000, purpose = 'judge' } = {}) {
   const k = key('OPENCODE_GO_API_KEY'); if (!k) throw new Error('no key');
+  const quota=quotaSnapshot();
+  if (!assess(quota.providers.go,{model,quick:true},reservations(quota)).allowed) throw new Error('Go 额度底线阻止本次判断');
   const t0 = Date.now();
   let ok = false;
   try {

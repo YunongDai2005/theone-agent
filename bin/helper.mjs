@@ -1,19 +1,21 @@
 #!/usr/bin/env node
 /**
- * helper：外援任务管理器（GPT / Claude / Go 顾问）。2026-09-28 Mac 端 Claude 写，同日第二版：三个顾问都能带工具干活 + WorkTree + 按额度自动选。
+ * helper：外援任务管理器（GPT / Claude / Go 顾问）。2026-09-28 Mac 端 Claude 写，同日第二版：四个顾问都能带工具干活 + WorkTree + 按额度自动选。
  *
  * 为什么要它：外援独立运行（systemd scope），DSH 这一轮结束、路由重启都不会把它带走；运行中写实时动态，随时能查。
  *
- * 三个顾问（都能自己读文件；--work 时能改文件、跑命令）：
+ * 四个顾问（都能自己读文件；--work 时能改文件、跑命令）：
  *   claude  你的 Claude 订阅（和主人共用）   Claude Code，默认 Opus 5.5 · high
  *   gpt     你的 ChatGPT Plus               官方 Codex 命令行，默认 gpt-6-sol
  *   go      OpenCode Go 包月                DSH 换成 Go 里的强模型跑，默认 kimi-k3（⚠️ 按 4 倍扣 Go 额度）
  *           另有「快问」模式 --chat：只聊天不读文件，默认 gpt-6-luna，10 秒左右、最省
+ *   wb      WorkBuddy（腾讯 CodeBuddy 本地反代，免费）  默认 kimi-k3-1。2026-09-30 加：Go 周额度满被限流时的替身。
+ *           网关 127.0.0.1:8317，实测 credit≈0（免费），能带工具读文件/改代码。可选模型见 WB_TOOL_MODELS。
  *
  * 用法（DSH 里一律这样调，别自己包 timeout / nohup / run_in_background）：
  *   helper start auto   --title "短标题" --file 问题.md [--work --repo <git 仓库目录>] [--hard|--quick]
- *        ← 推荐：看三家额度 + 任务难度，自动选顾问和模型（经理的快模型判断，硬规则兜底），会打印选择理由
- *   helper start claude|gpt|go [--model M] [--effort E] [--work] [--repo 目录] [--chat] --title "短标题" (--file 问题.md | "问题")
+ *        ← 推荐：看四家额度 + 任务难度，自动选顾问和模型（经理的快模型判断，硬规则兜底），会打印选择理由
+ *   helper start claude|gpt|go|wb [--model M] [--effort E] [--work] [--repo 目录] [--chat] --title "短标题" (--file 问题.md | "问题")
  *   helper wait <编号> [--max 240]   最多等 N 秒（默认 240，上限 540）；0=做完并输出结果 · 10=还在跑（先报进度再 wait）· 1=失败
  *   helper status [编号] / helper result <编号> / helper kill <编号>
  *
@@ -30,16 +32,21 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
-import { record } from '/home/aibox/bin/helper-ledger.mjs';
+import { record } from './helper-ledger.mjs';
+import { quotaSnapshot, dispatchSnapshot, refreshQuota as refreshQuotaCache, reservations, withLock } from '../wx-router/src/core/quota-runtime.mjs';
+import { chat as selectChat } from '../wx-router/src/core/llm.mjs';
+import { assess, prioritize, describe } from '../wx-router/src/core/quota-policy.mjs';
 
 const ROOT = '/home/aibox/.aibox/helper-jobs';
 const WT_ROOT = '/home/aibox/.aibox/worktrees';
 const LOG = '/home/aibox/.aibox/logs/helpers.log';
 const KEEP_DAYS = 30;
-const NAME = { gpt: 'GPT', claude: 'Claude', go: 'Go 顾问' };
-const DEFAULT_MODEL = { gpt: 'gpt-6-sol', claude: 'claude-opus-5-5', go: 'kimi-k3' };
+const NAME = { gpt: 'GPT', claude: 'Claude', go: 'Go 顾问', wb: 'WorkBuddy' };
+const DEFAULT_MODEL = { gpt: 'gpt-6-sol', claude: 'claude-opus-5-5', go: 'kimi-k3', wb: 'kimi-k3-1' };
 // Go 里能让 DSH 带工具驱动的模型（openai-completions 协议）；gpt-6-luna / grok 只认 /responses，只能 --chat 快问
 const GO_TOOL_MODELS = { 'kimi-k3': 256000, 'deepseek-v4-pro': 1000000, 'glm-5.3': 200000, 'deepseek-v4.1-flash': 1000000, 'minimax-m3': 200000, 'qwen3.7-plus': 256000 };
+// WorkBuddy 网关（腾讯 CodeBuddy 反代，免费）里能带工具跑的模型。2026-09-30 加，给 Go 限流时当替身。
+const WB_TOOL_MODELS = { 'kimi-k3-1': 1000000, 'hy4-preview': 1000000, 'deepseek-v4.1-flash': 1000000, 'deepseek-v4-pro': 1000000, 'glm-5.3': 1000000, 'minimax-m3': 200000 };
 
 const rj = (p, d = null) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return d; } };
 const wj = (p, o) => { fs.writeFileSync(p + '.tmp', JSON.stringify(o, null, 2)); fs.renameSync(p + '.tmp', p); };
@@ -64,61 +71,64 @@ function commitAll(repo, msg, author) {
 const MAIN_AUTHOR = 'AI Box 自动快照 <aibox@example.invalid>';
 const HELPER_AUTHOR = (m) => NAME[m.helper] + '-helper <' + m.helper + '-helper@example.invalid>';
 
-// ---------- 额度（给自动选择用）----------
-function quotaView() {
-  const q = rj('/home/aibox/.aibox/quota.json', {}) || {};
-  const left = (ws) => { const v = Object.values(ws || {}).filter((w) => w && w.usedPercent != null).map((w) => 100 - w.usedPercent); return v.length ? Math.min(...v) : null; };
-  const soonest = (ws) => { const t = Object.values(ws || {}).filter((w) => w && w.resetsAt).map((w) => Date.parse(w.resetsAt)); return t.length ? new Date(Math.min(...t)).toISOString() : null; };
-  const win = (ws) => Object.entries(ws || {}).filter(([, w]) => w).map(([k, w]) => k + '剩' + (w.usedPercent == null ? '?' : Math.round(100 - w.usedPercent) + '%') + (w.resetsAt ? '(' + new Date(w.resetsAt).toLocaleString('zh-CN', { hour12: false, month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) + '重置)' : '')).join(' ');
-  return {
-    updatedAt: q.updatedAt,
-    claude: q.claude && q.claude.ok ? { left: left(q.claude.windows), limited: q.claude.available === false, text: win(q.claude.windows) || '（没有读数）', calls: q.claude.advisor && q.claude.advisor.calls } : null,
-    gpt: q.chatgpt && q.chatgpt.ok ? { left: left(q.chatgpt.windows), limited: !!q.chatgpt.limitReached, text: win(q.chatgpt.windows), calls: q.chatgpt.advisor && q.chatgpt.advisor.calls, soonest: soonest(q.chatgpt.windows) } : null,
-    go: q.go && q.go.ok ? { left: left(q.go.windows), limited: !!q.goCooldownUntil, text: win(q.go.windows), pace: q.go.pace } : null,
-  };
+// ---------- 额度：面板/经理/顾问共用上游观测时间和所有窗口的底线 ----------
+function wbUp() {
+  try {
+    const r = spawnSync('curl', ['-s', '-o', '/dev/null', '-m', '3', '-w', '%{http_code}', 'http://127.0.0.1:8317/v1/models'], { encoding: 'utf8' });
+    return ['200', '401'].includes(String(r.stdout || '').trim());
+  } catch { return false; }
 }
+function quotaView() { return quotaSnapshot().providers; }
 async function managerPick(task, opts, cands, qv) {
   // 用经理的快模型判断（Go · deepseek-v4.1-flash，关思考，约 3 秒）；失败就按硬规则
-  let key = ''; try { const s = fs.readFileSync('/home/aibox/.dsh/.credentials.yaml', 'utf8'); key = (s.match(/^\s*OPENCODE_GO_API_KEY:\s*(\S+)/m) || [])[1] || ''; key = key.replace(/^["']|["']$/g, ''); } catch {}
-  const sys = `你是经理，负责给一个外援任务挑顾问。只输出 JSON：{"pick": 候选编号(数字), "effort": "low|medium|high", "reason": "一句话理由（中文）"}。
-挑选原则（按重要性）：
-1. 能不能干：要改文件/跑命令（干活）三家都行；只是快速核对、简单问题 → 优先最省的。
-2. 难度：难、关键、要写/审大段代码 → 选强的（Claude Opus、GPT-6、Kimi K3）；一般问题中等即可。
-3. 额度：谁剩得多用谁；某家快重置但还剩很多 → 优先用它（不用就浪费了）；某家剩不到 25% → 尽量别用。
-4. Claude 和主人自己共用，主人常用：Claude 5 小时剩不到 40% 时让给别家。
-5. Go 的强模型按 4 倍扣 Go 月额度；Go 月额度节奏偏低时可以多用。`;
-  const user = '【任务】' + cut(task, 1200) + '\n【模式】' + (opts.work ? '干活（要改文件' + (opts.repo ? '，在 WorkTree 里' : '') + '）' : '顾问（只读）') + (opts.hard ? '；主人/DSH 标了：难' : '') + (opts.quick ? '；标了：快速小问题' : '') +
-    '\n【额度】Claude：' + (qv.claude ? qv.claude.text : '未知') + '\nGPT（ChatGPT Plus）：' + (qv.gpt ? qv.gpt.text : '未知') + '\nGo 包月：' + (qv.go ? qv.go.text + (qv.go.pace ? '；本月第' + qv.go.pace.day + '天，按节奏应用' + qv.go.pace.expected + '%、实际' + qv.go.pace.used + '%' : '') : '未知') +
-    '\n【候选】\n' + cands.map((c, i) => i + '. ' + c.label + '：' + c.note).join('\n');
-  if (!key) return null;
+  const sys = `你是经理，给已有的外援任务挑适合的顾问。只输出 JSON：{"pick":候选编号,"suitable":[同样适合任务的编号],"effort":"low|medium|high","reason":"一句话中文理由"}。
+能力优先。任务需要读文件/改代码时不能选只聊天的顾问；安全/架构/复杂代码用强顾问。
+候选已通过所有额度窗口、在途预留和并发限制，不可绕过。数据未知只允许谨慎尝试，不当成满额。
+同样适合的同级候选中，优先临近重置且还有余量的线路；代码会执行这个优先级。
+5小时、周、月和已知模型独立额度都可能限制派工。短窗重置不免除长周期消耗。
+Claude与主人共用；Go强模型按4倍扣；WorkBuddy是月刷新套餐，不假定免费。
+suitable只列你确认同样适合的候选；不要为了用额度编造任务。`;
+  const user = '【任务】' + cut(task, 1200) + '\n【模式】' + (opts.work ? '干活（改文件）' : '顾问（只读）') + (opts.hard ? '；复杂任务' : '') + (opts.quick ? '；快速小问题' : '') +
+    '\n【额度】\n' + Object.values(qv).map(p => p.text).join('\n') +
+    '\n【候选】\n' + cands.map((c, i) => i + '. ' + c.label + '：' + c.note + (c.quota.urgent ? '；' + c.quota.urgent.minutes + '分钟后重置，剩' + Math.round(c.quota.urgent.left) + '%' : '')).join('\n');
   try {
-    const r = await fetch('https://opencode.ai/zen/go/v1/chat/completions', { method: 'POST', signal: AbortSignal.timeout(20000), headers: { 'content-type': 'application/json', authorization: 'Bearer ' + key, 'x-opencode-session': 'ses_aibox_pick' },
-      body: JSON.stringify({ model: 'deepseek-v4.1-flash', thinking: { type: 'disabled' }, response_format: { type: 'json_object' }, temperature: 0.2, max_tokens: 300, messages: [{ role: 'system', content: sys }, { role: 'user', content: user }] }) });
-    const j = await r.json(); const o = JSON.parse(j.choices[0].message.content);
-    const c = cands[Number(o.pick)];
-    return c ? { ...c, effort: ['low', 'medium', 'high'].includes(o.effort) ? o.effort : c.effort, reason: String(o.reason || '').slice(0, 160), by: '经理' } : null;
+    const r = await selectChat([{ role:'system',content:sys },{role:'user',content:user}], {session:'ses_aibox_pick',maxTokens:400,purpose:'advisor-select'});
+    const o = JSON.parse(r.text);
+    const index = Number(o.pick), c = cands[index];
+    const suitable = Array.isArray(o.suitable) ? o.suitable.filter(i => Number.isInteger(i) && cands[i]) : [index];
+    return c ? { ...c, index, suitable: [...new Set([index, ...suitable])], effort: ['low', 'medium', 'high'].includes(o.effort) ? o.effort : c.effort, reason: String(o.reason || '').slice(0, 160), by: '经理' } : null;
   } catch (e) { log('AUTO 经理判断失败 ' + e.message); return null; }
 }
 async function choose(task, opts) {
-  const qv = quotaView();
+  const snap = await dispatchSnapshot(), qv = snap.providers, held = reservations(snap);
   const cands = [];
-  const ok = (v) => v && !v.limited && (v.left == null || v.left >= 10);   // 硬规则：限流或剩不到 10% 的不参与
-  if (ok(qv.claude)) cands.push({ helper: 'claude', model: opts.quick ? 'sonnet' : 'claude-opus-5-5', effort: opts.quick ? 'medium' : 'high', left: qv.claude.left ?? 50,
-    label: 'Claude ' + (opts.quick ? 'Sonnet' : 'Opus 5.5'), note: '最强之一，能读文件/改代码；和主人共用额度（' + qv.claude.text + '）' });
-  if (ok(qv.gpt)) cands.push({ helper: 'gpt', model: opts.quick ? 'gpt-5.6-sol' : 'gpt-6-sol', effort: opts.quick ? 'low' : 'high', left: qv.gpt.left ?? 50,
-    label: 'GPT ' + (opts.quick ? '5.6-Sol' : '6-Sol'), note: '最强之一，能读文件/改代码；ChatGPT Plus（' + qv.gpt.text + '）' });
-  if (ok(qv.go)) {
-    cands.push({ helper: 'go', model: 'kimi-k3', effort: 'high', left: qv.go.left ?? 50, label: 'Go·Kimi K3', note: '强，能读文件/改代码（DSH 工具）；Go 包月按 4 倍扣（' + qv.go.text + '）' });
-    cands.push({ helper: 'go', model: 'deepseek-v4-pro', effort: 'high', left: qv.go.left ?? 50, label: 'Go·DeepSeek V4 Pro', note: '中上，能读文件/改代码；Go 包月按 4 倍扣' });
-    if (!opts.work) cands.push({ helper: 'go', model: 'gpt-6-luna', chat: true, effort: 'medium', left: qv.go.left ?? 50, label: 'Go·GPT-6 Luna 快问', note: '10 秒左右、最省，但读不了文件（只适合把内容贴进问题的小问题）' });
+  const add = (c) => {
+    const p = qv[c.helper]; const quota = assess(p, { ...opts, model: c.model }, held);
+    if (quota.allowed) cands.push({ ...c, quota, left: p.left, note: c.note + '；' + describe(p), snapshotId: snap.id });
+  };
+  add({ helper: 'claude', model: opts.quick ? 'sonnet' : 'claude-opus-5-5', effort: opts.quick ? 'medium' : 'high', tier: opts.quick ? 1 : 3, label: opts.quick ? 'Claude Sonnet' : 'Claude Opus 5.5', note: '能读文件/改代码；和主人共用' });
+  add({ helper: 'gpt', model: opts.quick ? 'gpt-5.6-sol' : 'gpt-6-sol', effort: opts.quick ? 'low' : 'high', tier: opts.quick ? 1 : 3, label: opts.quick ? 'GPT 5.6-Sol' : 'GPT 6-Sol', note: '能读文件/改代码；ChatGPT Plus' });
+  add({ helper: 'go', model: 'kimi-k3', effort: 'high', tier: 3, label: 'Go·Kimi K3', note: '强，能读文件/改代码；按4倍扣Go总额度' });
+  add({ helper: 'go', model: 'deepseek-v4-pro', effort: 'high', tier: 2, label: 'Go·DeepSeek V4 Pro', note: '能读文件/改代码；按4倍扣Go总额度' });
+  if (opts.quick && !opts.work && !opts.hard) add({ helper: 'go', model: 'gpt-6-luna', chat: true, effort: 'medium', tier: 1, label: 'Go·Luna 快问', note: '只适合已贴全信息的小问题，不能读文件' });
+  if (wbUp()) {
+    add({ helper: 'wb', model: 'kimi-k3-1', effort: 'high', tier: 3, label: 'WorkBuddy·Kimi K3', note: '强，能读文件/改代码；月刷新套餐' });
+    add({ helper: 'wb', model: 'deepseek-v4-pro', effort: 'high', tier: 2, label: 'WorkBuddy·DeepSeek V4 Pro', note: '能读文件/改代码；月刷新套餐' });
   }
-  if (!cands.length) throw new Error('三家额度都快用完或被限流了：' + JSON.stringify({ claude: qv.claude && qv.claude.text, gpt: qv.gpt && qv.gpt.text, go: qv.go && qv.go.text }));
-  let pick = await managerPick(task, opts, cands, qv);
-  if (!pick) {   // 兜底：剩得最多的；快问优先最省的
-    const pool = opts.quick ? cands.filter((c) => c.chat).concat(cands) : cands.filter((c) => !c.chat);
-    pick = { ...pool.slice().sort((a, b) => b.left - a.left)[0], reason: '经理没回，按剩余额度最多的选', by: '硬规则' };
+  const pool = opts.hard ? cands.filter(c => c.tier === 3) : cands;
+  if (!pool.length) throw new Error('没有满足任务和额度底线的顾问：' + Object.values(qv).map(p => p.text).join('；'));
+  let pick = await managerPick(task, opts, pool, qv);
+  if (!pick) {
+    const tier = opts.quick && !opts.work && !opts.hard ? Math.min(...pool.map(c => c.tier)) : Math.max(...pool.map(c => c.tier));
+    const suitable = pool.map((c, i) => c.tier === tier ? i : -1).filter(i => i >= 0);
+    suitable.sort((a, b) => Number(qv[pool[b].helper].fresh) - Number(qv[pool[a].helper].fresh) || (pool[b].left ?? -1) - (pool[a].left ?? -1));
+    pick = { ...pool[suitable[0]], index: suitable[0], suitable, reason: '经理未返回，按任务能力、数据可信度和余量选择', by: '硬规则' };
   }
-  return pick;
+  const best = prioritize(pool, pick.index, pick.suitable);
+  const urgency = best.quota.urgent;
+  return { ...pick, ...best, effort: best.index === pick.index ? pick.effort : best.effort,
+    reason: urgency ? best.label + '适合任务，' + urgency.minutes + '分钟后重置，剩' + Math.round(urgency.left) + '%，优先派工' : pick.reason,
+    by: urgency ? '经理 + 额度规则' : pick.by };
 }
 
 // ---------- 状态 / 展示 ----------
@@ -173,9 +183,9 @@ function findDsh() {
 // ---------- 命令 ----------
 const [cmd, ...args] = process.argv.slice(2);
 
-if (cmd === 'start') {
-  let helper = args.shift();
-  if (!['claude', 'gpt', 'go', 'auto'].includes(helper)) { console.error('用法：helper start auto|claude|gpt|go [选项] --title "短标题" (--file 问题.md | "问题")'); process.exit(2); }
+if (cmd === 'start' || cmd === 'plan') {
+  let helper = cmd === 'plan' ? 'auto' : args.shift();
+  if (!['claude', 'gpt', 'go', 'wb', 'auto'].includes(helper)) { console.error('用法：helper start auto|claude|gpt|go|wb [选项] --title "短标题" (--file 问题.md | "问题")'); process.exit(2); }
   const o = { title: '', file: null, work: false, repo: null, model: null, effort: null, cwd: process.cwd(), resume: null, maxMin: null, chat: false, hard: false, quick: false };
   const text = [];
   for (let i = 0; i < args.length; i++) {
@@ -190,17 +200,24 @@ if (cmd === 'start') {
   if (!prompt.trim() || prompt.trim() === '-') prompt = fs.readFileSync(0, 'utf8');
   if (!prompt.trim()) { console.error('没有问题内容：用 --file 或直接写在后面'); process.exit(2); }
   fs.mkdirSync(ROOT, { recursive: true }); cleanup();
+  await withLock('quota-dispatch', async () => {
   let auto = null;
   if (helper === 'auto') {
     try { auto = await choose(prompt, o); } catch (e) { console.error('自动选择失败：' + e.message); process.exit(3); }
-    helper = auto.helper; o.model = o.model || auto.model; o.effort = o.effort || auto.effort; if (auto.chat) o.chat = true;
+    helper = auto.helper; if (o.model && o.model !== auto.model) { console.error('auto 不接受不同模型覆盖；请明确指定顾问和模型'); process.exit(2); } o.model = auto.model; o.effort = o.effort || auto.effort; if (auto.chat) o.chat = true;
     log('AUTO pick=' + helper + ':' + o.model + ' by=' + auto.by + ' reason=' + JSON.stringify(auto.reason));
   }
   const model = o.model || (helper === 'go' && o.chat ? 'gpt-6-luna' : DEFAULT_MODEL[helper]);
   if (helper === 'go' && !o.chat && !GO_TOOL_MODELS[model]) o.chat = true;          // 只认 /responses 的模型只能快问
+  if (helper === 'wb' && !o.chat && !WB_TOOL_MODELS[model]) { console.error('WorkBuddy 线路里没有能带工具跑的模型：' + model + '，可选：' + Object.keys(WB_TOOL_MODELS).join('/')); process.exit(2); }
   if (o.chat && o.work) { console.error('快问模式（--chat）读不了也改不了文件，不能 --work'); process.exit(2); }
+  const snap = await dispatchSnapshot();
+  const checked = assess(snap.providers[helper], { ...o, model }, reservations(snap));
+  if (!checked.allowed) { console.error(NAME[helper] + '暂不能派工：' + checked.reasons.join('；')); process.exit(3); }
+  if (cmd === 'plan') { console.log(JSON.stringify({ helper, model, snapshotId: snap.id, reason: auto.reason, confidence: checked.confidence, urgent: checked.urgent, reservation: checked.cost }, null, 2)); process.exit(0); }
+  const quotaReservation = { cost: checked.cost, resets: Object.fromEntries(Object.entries(snap.providers[helper].windows).map(([k,w]) => [k,w.resetAt])), snapshotId: snap.id, confidence: checked.confidence };
   const d = new Date(), p2 = (n) => String(n).padStart(2, '0');
-  const id = ({ gpt: 'g', claude: 'c', go: 'o' }[helper]) + '-' + p2(d.getMonth() + 1) + p2(d.getDate()) + '-' + p2(d.getHours()) + p2(d.getMinutes()) + p2(d.getSeconds()) + '-' + Math.random().toString(16).slice(2, 4);
+  const id = ({ gpt: 'g', claude: 'c', go: 'o', wb: 'w' }[helper]) + '-' + p2(d.getMonth() + 1) + p2(d.getDate()) + '-' + p2(d.getHours()) + p2(d.getMinutes()) + p2(d.getSeconds()) + '-' + Math.random().toString(16).slice(2, 4);
   fs.mkdirSync(dir(id));
   fs.writeFileSync(path.join(dir(id), 'prompt.txt'), prompt, { mode: 0o600 });
   let cwd = path.resolve(o.cwd), wt = null, branch = null, repo = null;
@@ -215,7 +232,7 @@ if (cmd === 'start') {
     cwd = path.join(wt, path.relative(repo, path.resolve(o.repo)));
   }
   wj(path.join(dir(id), 'meta.json'), { id, helper, model, effort: o.effort, work: o.work, chat: o.chat, title: o.title || cut(prompt, 30), startedAt: d.toISOString(), status: 'running',
-    dshPid: findDsh(), cwd, repo, wt, branch, resume: o.resume, maxMin: o.maxMin || (o.work ? 40 : 25), auto });
+    dshPid: findDsh(), cwd, repo, wt, branch, resume: o.resume, maxMin: o.maxMin || (o.work ? 40 : 25), auto, quotaReservation });
   const script = new URL(import.meta.url).pathname;
   const tryScope = () => new Promise((resolve) => {
     let r; try { r = spawn('systemd-run', ['--user', '--scope', '--quiet', '--collect', '--unit=helper-' + id, process.execPath, script, '_run', id], { detached: true, stdio: 'ignore', cwd }); } catch { return resolve(null); }
@@ -235,6 +252,7 @@ if (cmd === 'start') {
   else if (o.work) console.log('⚠️ 没给 --repo：直接在 ' + cwd + ' 里改，没有 WorkTree 保护。');
   console.log('它在后台跑，你这一轮结束也不会被杀。查看：helper wait ' + id + ' --max 240 · helper status ' + id);
   process.exit(0);
+  }, 65000);
 }
 
 if (cmd === '_run') {
@@ -261,6 +279,18 @@ if (cmd === '_run') {
       '            contextWindow: ' + (GO_TOOL_MODELS[m.model] || 128000), '            input: [text]', '- id: agent-default-model', '  config:', '    provider: opencode-go', '    model: ' + m.model, ''].join('\n'));
     bin = '/usr/local/bin/dsh'; mode = 'dsh'; argv = ['--profile', 'headless', '--patch', patch, '--json', '-'];
     env.DSH_PERMISSION_MODE = m.work ? 'workspace-write' : 'read-only'; env.OPENCODE_SESSION = 'ses_aibox_goadvisor';
+  } else if (m.helper === 'wb' && !m.chat) {
+    // WorkBuddy（本地网关反代的腾讯 CodeBuddy，月刷新套餐）——Go 限流时的替身。协议同 go，只换 baseURL/密钥。
+    const patch = path.join(D, 'wb-model.yml');
+    fs.writeFileSync(patch, ['# 外援 ' + id + '：这一次 DSH 用 WorkBuddy 的 ' + m.model + ' 跑（月刷新套餐）', '- id: llm-pi-ai', '  config:', '    providers:', '      workbuddy-advisor:', '        displayName: WorkBuddy (advisor)', '        apiKeyEnv: WORKBUDDY_GATEWAY_API_KEY', '        api: openai-completions',
+      '        baseURL: http://127.0.0.1:8317/v1', '        models:', '          - id: ' + m.model, '            name: ' + m.model + ' (WorkBuddy)',
+      '            contextWindow: ' + (WB_TOOL_MODELS[m.model] || 200000), '            input: [text]', '- id: agent-default-model', '  config:', '    provider: workbuddy-advisor', '    model: ' + m.model, ''].join('\n'));
+    bin = '/usr/local/bin/dsh'; mode = 'dsh'; argv = ['--profile', 'headless', '--patch', patch, '--json', '-'];
+    env.DSH_PERMISSION_MODE = m.work ? 'workspace-write' : 'read-only';
+    // 密钥从 ~/.dsh/.credentials.yaml 的 refs 取（DSH 由 systemd 拉起，不读 ~/.bashrc）
+    const cy = fs.readFileSync('/home/aibox/.dsh/.credentials.yaml', 'utf8');
+    const wbKey = ((cy.match(/^\s*WORKBUDDY_GATEWAY_API_KEY:\s*(\S+)/m) || [])[1] || '').replace(/^["']|["']$/g, '');
+    if (wbKey) env.WORKBUDDY_GATEWAY_API_KEY = wbKey;
   } else {
     bin = process.execPath; argv = ['/home/aibox/bin/ask-go.mjs', m.model, ...(m.effort ? ['--effort', m.effort] : []), '--stdin'];
   }
@@ -323,6 +353,7 @@ if (cmd === '_run') {
     }
     live.phase = ok ? '完成' : '失败'; liveWrite(true);
     setMeta(id, patch);
+    await refreshQuotaCache({ force: true });
     const fin = meta(id);
     log(id + (ok ? ' DONE' : ' FAILED') + ' exit=' + code + (signal ? ' signal=' + signal : '') + ' secs=' + Math.round((Date.parse(fin.endedAt) - Date.parse(fin.startedAt)) / 1000) +
       ' outBytes=' + fs.statSync(path.join(D, 'out.txt')).size + (fin.branch ? ' changed=' + !!fin.changed + (fin.diffstat ? ' diff=' + JSON.stringify(cut(fin.diffstat, 120)) : '') : '') + (ok ? '' : ' err=' + cut(fin.error, 200)) + ' dshAlive=' + !!(fin.dshPid && alive(fin.dshPid)));
@@ -360,7 +391,7 @@ if (cmd === '_run') {
     const run = ms.filter((m) => m.status === 'running'), rest = ms.filter((m) => m.status !== 'running').slice(0, 8);
     if (!ms.length) console.log('还没有外援任务');
     for (const m of [...run, ...rest]) console.log(line(m) + (m.status !== 'running' && !m.delivered ? '\n   （结果还没被取走：helper result ' + m.id + '）' : ''));
-    const qv = quotaView(); console.log('\n额度：Claude ' + (qv.claude ? qv.claude.text : '?') + ' · GPT ' + (qv.gpt ? qv.gpt.text : '?') + ' · Go ' + (qv.go ? qv.go.text : '?'));
+    const qv = quotaView(); console.log('\n额度：' + Object.values(qv).map(p => p.text).join(' · '));
   }
 } else if (cmd === 'result') {
   const m = refresh(args[0]); if (!m) { console.error('没有这个任务'); process.exit(2); }

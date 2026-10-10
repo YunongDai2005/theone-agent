@@ -38,3 +38,10 @@ function pump(chat) {
 export function queueState(chat) { const q = queues.get(chat); return q ? { running: q.running, waiting: q.items.length } : { running: false, waiting: 0 }; }
 export function queueBusy(chat) { const q = queues.get(chat); return !!(q && (q.running || q.items.length)); }
 export function allQueues() { return [...queues.entries()].map(([chat, q]) => ({ chat, running: q.running, waiting: q.items.length })); }
+
+/** Drop unstarted work when the owner stops; settle promises so receipt claims release. */
+export function clearQueued(chat) {
+  const q = queues.get(chat); if (!q) return 0;
+  const items = q.items.splice(0); for (const item of items) item.resolve({ cancelled: true });
+  return items.length;
+}

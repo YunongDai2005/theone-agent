@@ -98,4 +98,35 @@ export default [
       assert.equal(env.texts().filter((t) => t.includes('上下文用到')).length, 1, '只提醒一次');
     },
   },
+  {
+    // 回归（2026-09-30 主人反馈"换会话太频繁"的根因）：
+    // 水位必须取【最后一个 step】的输入，不能取峰值。
+    // 长 turn 中间某一步很重（工具输出多）不代表对话真的占满了上下文。
+    name: '上下文水位取最后一步，不取单步峰值',
+    setup: (env) => preset(env, {}),
+    async run(env) {
+      // 单步峰值 200000（超过预算 160000），但最后一步只有 30000 → 不该触发换会话
+      await env.say('干活 #steps=200000,30000');
+      await env.waitText('ECHO:干活');
+      await env.idle();
+      const meta = env.readJson('wx-router/dsh-session-meta.json').wxid_owner;
+      assert.equal(meta.ctxIn, 30000, '水位 = 最后一步的输入，不是峰值 200000');
+      assert.ok(!env.texts().some((t) => t.includes('换了新会话')), '峰值高但实际没满 → 不换会话');
+    },
+  },
+  {
+    // 同一会话内水位单调：短 turn 不该把水位拉低（否则会反复来回横跳）
+    name: '上下文水位同一会话内单调，不被短 turn 拉低',
+    setup: (env) => preset(env, {}),
+    async run(env) {
+      await env.say('先干 #steps=100000');
+      await env.waitText('ECHO:先干');
+      await env.idle();
+      await env.say('再干 #steps=20000');
+      await env.waitText('ECHO:再干');
+      await env.idle();
+      const meta = env.readJson('wx-router/dsh-session-meta.json').wxid_owner;
+      assert.equal(meta.ctxIn, 100000, '保留见过的最大值，不被 20000 拉低');
+    },
+  },
 ];

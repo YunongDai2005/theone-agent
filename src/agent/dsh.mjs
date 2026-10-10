@@ -3,6 +3,8 @@
  *   看门狗「卡死才杀」：连续 dshIdleMs 没有任何输出 = 卡死；dshTimeoutMs 是总上限兜底。
  *   线路：OpenCode Go 主力；额度满/故障时叠加 fallback 补丁走 DeepSeek 官方（goCooldownMs 冷却）。
  */
+import { refreshQuota as refreshQuotaCache } from '../core/quota-runtime.mjs';
+import { runService } from './service-runner.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -18,33 +20,39 @@ export function setGoCooldown(ms) { writeJson(paths.goState, { cooldownUntil: Da
 export function coolingDown() { return Date.now() < goCooldownUntil(); }
 export function routeLabel() {
   const until = goCooldownUntil();
-  if (Date.now() < until) return 'DeepSeek 按量（Go 额度冷却到 ' + new Date(until).toTimeString().slice(0, 5) + '）';
-  return 'Go 订阅（额度满自动切 DeepSeek）';
+  if (Date.now() < until) return 'WorkBuddy 免费（Go 额度冷却到 ' + new Date(until).toTimeString().slice(0, 5) + '）';
+  return 'Go 订阅（额度满自动切 WorkBuddy）';
 }
 export function noFinal(r) { return !(r.final && String(r.final).trim()); }
 export function isQuotaErr(t) { return /QUOTA|RATE_LIMIT|\b429\b|limit|exceed|insufficient|额度/i.test(t || ''); }
 export function isSessionLost(r) { return /does not exist; omit --session-id/.test(r.errTail || ''); }
 export function ocSession(chat, sid) { return 'ses_' + crypto.createHash('sha1').update(chat + '|' + (sid || '')).digest('hex').slice(0, 24); }
 
-// 用完一次模型就顺手刷新额度（60 秒内最多一次）
-let lastQuotaRefresh = 0;
-export function refreshQuota() {
-  if (Date.now() - lastQuotaRefresh < 60000) return;
-  lastQuotaRefresh = Date.now();
-  const script = path.join(paths.bin, 'aibox-quota.mjs');
-  if (!fs.existsSync(script)) return;
-  try { spawn(process.execPath, [script], { detached: true, stdio: 'ignore' }).unref(); } catch {}
-}
+// 任务结束后刷新统一快照；刷新器合并并发请求，后台执行不阻塞回复。
+export function refreshQuota() { refreshQuotaCache({ force: true }).catch(e => log('quota refresh ERROR ' + e.message)); }
 
 /**
  * 跑一轮。opts: { fallback, ocSession, timeoutMs, idleMs, onEvent, generation, register }
- * 返回 { code, signal, killedBy, interrupted, stale, forced, runId, generation, sessionId, final, usage, usagePeak, errTail, fallback }
+ * 返回 { code, signal, killedBy, interrupted, stale, forced, runId, generation, sessionId, final, usage, usagePeak, ctxFill, errTail, fallback }
+ *
+ * usage     = 所有 step 的输入累加（观察"这一轮总共花了多少"）
+ * usagePeak = 单步输入的最大值（观察"最重的一步有多重"）
+ * ctxFill   = **该轮最后一个 step 的输入**（input+cacheRead+cacheWrite）
+ *             —— 这才是"当前对话占了多少 context"的正确口径：
+ *             最后一个 step 的 prompt 含完整历史，且不含后续工具输出。
+ *             不能拿 usagePeak 当水位：turn 里工具调用越多峰值越高，
+ *             它混进了"这轮干了多少活"，会让长任务被误判成"上下文满了"。
  * 无论怎样结束都会 resolve（否则聊天队列会永久卡住）。
  */
 export function runDsh(task, sid, opts = {}) {
+  if (cfg.dshTransport === 'service') return runService(task, sid, opts);
+  return runHeadless(task, sid, opts);
+}
+export function runHeadless(task, sid, opts = {}) {
   return new Promise((resolve) => {
     const args = ['--profile', 'headless'];                  // 启动器参数（--patch）必须在应用参数之前
-    if (opts.fallback) args.push('--patch', cfg.fallbackPatch);
+    // fallback: 1/true = 第一层（WorkBuddy 免费）；2 = 第二层（付费 DeepSeek 兜底）
+    if (opts.fallback) args.push('--patch', opts.fallback === 2 ? cfg.fallbackPatch2 : cfg.fallbackPatch);
     args.push('--json');
     if (sid) args.push('--session-id', sid);
     args.push('-');
@@ -54,7 +62,7 @@ export function runDsh(task, sid, opts = {}) {
       env: { ...process.env, DSH_PERMISSION_MODE: 'danger-full-access', OPENCODE_SESSION: opts.ocSession || 'ses_aibox_default', AIBOX_CHAT: opts.chat || '', AIBOX_RUN_ID: runId },
       stdio: ['pipe', 'pipe', 'pipe'], detached: true,
     });
-    let buf = '', errTail = '', sessionId = sid || null, final = null, usage = 0, usagePeak = 0, errEvents = '';
+    let buf = '', errTail = '', sessionId = sid || null, final = null, usage = 0, usagePeak = 0, ctxFill = 0, errEvents = '';
     const t0 = Date.now(), maxMs = opts.timeoutMs || cfg.dshTimeoutMs, idleMs = opts.idleMs || cfg.dshIdleMs;
     let lastOut = t0, killedBy = null;
     const generation = opts.generation;
@@ -94,7 +102,7 @@ export function runDsh(task, sid, opts = {}) {
       if (killedBy) log('dsh ended by=' + killedBy + ' after=' + Math.round((Date.now() - t0) / 1000) + 's idle=' + Math.round((Date.now() - lastOut) / 1000) + 's');
       resolve({
         code, signal, killedBy, interrupted, stale, forced, runId, generation,
-        sessionId, final, usage, usagePeak, took: Date.now() - t0,
+        sessionId, final, usage, usagePeak, ctxFill, took: Date.now() - t0,
         errTail: (errEvents + ' ' + errTail).trim(), fallback: !!opts.fallback,
       });
     }
@@ -115,13 +123,15 @@ export function runDsh(task, sid, opts = {}) {
         if (settled || !registration.isCurrent(runId)) return;
         let j; try { j = JSON.parse(line); } catch { continue; }
         if (opts.onEvent) { try { opts.onEvent(j); } catch {} }
-        if (j.type === 'session' && j.sessionId) sessionId = j.sessionId;
+        if (j.type === 'session' && j.sessionId) { sessionId = j.sessionId; opts.onSubmitted?.({ sessionId }); }
         else if (j.type === 'final') final = j.text;
+        else if (j.type === 'status' && j.phase === 'step_start') opts.onDelivered?.({ sessionId });
         else if (j.type === 'status' && j.phase === 'step_end' && j.usage) {
-          // 单步输入规模 = 未命中缓存 + 命中缓存（漏掉 cacheRead 会把上下文严重低估）
+          // 单步输入规模 = 未命中缓存 + 命中缓存 + 写入缓存（漏掉 cacheRead 会把上下文严重低估）
           const it = (j.usage.inputTokens || 0) + (j.usage.cacheReadTokens || 0) + (j.usage.cacheWriteTokens || 0);
           usage += it;
           if (it > usagePeak) usagePeak = it;
+          ctxFill = it;    // 覆盖式：留下的就是"最后一个 step"的输入 = 当前对话的实际占用量
         }
         else if (j.type === 'error' || (j.type === 'status' && j.phase === 'turn_end' && j.reason && j.reason.kind !== 'completed')) errEvents = (errEvents + ' ' + JSON.stringify(j)).slice(-800);
       }

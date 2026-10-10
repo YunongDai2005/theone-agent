@@ -1,0 +1,63 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { snapshot, assess, prioritize, windowView } from '../src/core/quota-policy.mjs';
+import { parseBilling, billingTime } from '../bin/workbuddy-quota.mjs';
+const now = Date.parse('2026-10-06T01:00:00Z');
+const iso = n => new Date(n).toISOString();
+const provider = (used=40, reset=now+2400000) => ({ ok:true, observedAt:iso(now), fetchedAt:iso(now), windows:{ '5小时':{usedPercent:used,resetsAt:iso(reset)},'每周':{usedPercent:20,resetsAt:iso(now+86400000)},'每月':{usedPercent:30,resetsAt:iso(now+86400000)} } });
+const p = (raw={}) => snapshot({updatedAt:iso(now),go:provider(),...raw},now).providers.go;
+assert.equal(windowView({usedPercent:99,resetsAt:iso(now-1)},now).left,null,'clock crossing is not a full quota');
+assert.equal(windowView({usedPercent:99,reset:true},now).left,null);
+assert.equal(p({go:{...provider(),observedAt:iso(now-120000)}}).state,'stale','near deadline requires 1min freshness');
+assert.equal(p({go:{...provider(40,now+7200000),observedAt:iso(now-120000)}}).state,'fresh','ordinary window 5min');
+assert.equal(p({go:{...provider(),asOf:null,observedAt:null}}).state,'unknown','writing a file cannot refresh a ledger');
+assert.equal(p({go:{...provider(),ok:false}}).left,null);
+assert.equal(p({go:provider(100)}).state,'unavailable');
+assert.equal(p({go:{...provider(100),ok:false}}).state,'unavailable','failed refresh cannot erase known exhaustion');
+assert.equal(p({go:provider(100,now-1)}).state,'pending_reset');
+assert.equal(assess(p(),{},[],now).urgent.minutes,40);
+assert.equal(assess(p({go:{...provider(),observedAt:iso(now-120000)}}),{},[],now).urgent,null);
+const constrained=provider();constrained.windows['每月'].usedPercent=95;
+assert.equal(assess(p({go:constrained}),{},[],now).allowed,false,'short deadline never overrides month cap');
+assert.equal(assess(p({go:provider(99)}),{},[],now).allowed,false);
+assert.equal(assess(p({go:{...provider(),modelLimits:{kimi:{usedPercent:100}}}}),{model:'kimi'},[],now).allowed,false);
+const held=[{helper:'go',cost:{'5小时':55},resets:{'5小时':now+2400000}}];
+assert.equal(assess(p(),{},held,now).urgent,null,'in-flight usage changes urgency');
+assert.equal(assess(p(),{},[...held,...held],now).allowed,false);
+assert.equal(assess(p({go:{ok:false}}),{},[{helper:'go'}],now).allowed,false,'unknown at most one');
+const candidate=(tier,urgent)=>({helper:'go',tier,quota:{allowed:true,urgent:urgent?{score:100}:null}});
+assert.equal(prioritize([candidate(3,false),candidate(3,true)],0,[0,1]).index,1);
+assert.equal(prioritize([candidate(3,false),candidate(2,true)],0,[0,1]).index,0,'no capability downgrade');
+assert.equal(prioritize([candidate(3,false),candidate(3,true)],0,[0]).index,0,'manager-confirmed suitability');
+const resources=[{Status:0,CycleStartTime:'2026-09-29 17:21:53',CycleEndTime:'2026-10-29 17:21:52',CycleCapacitySizePrecise:'2000',CycleCapacityRemainPrecise:'1800',PackageName:'月积分'},
+  {Status:0,CycleEndTime:iso(now+2400000),CycleCapacitySizePrecise:'1000',CycleCapacityRemainPrecise:'500',PackageName:'赠送积分'}];
+const bill=parseBilling({Packages:[{CycleTotalCapacity:'3000',CycleUsedCapacity:'700',CycleRemainCapacity:'2300'}]},resources,now);
+assert.equal(billingTime('2026-10-29 17:21:52'),Date.parse('2026-10-29T09:21:52Z'));
+assert.equal(bill.resetsAt,iso(now+2400000));assert.equal(bill.expiringPercent,500/3000*100,'only expiring portion accelerates');
+assert.equal(bill.buckets.length,2);assert.ok(!JSON.stringify(bill).includes('token'));
+assert.throws(()=>parseBilling({Packages:[{CycleTotalCapacity:'bad'}]},[],now));
+
+// Cross-process refresh coalescing and dispatch lock serialization, with isolated fake collector.
+const tmp=fs.mkdtempSync(path.join(os.tmpdir(),'aibox-quota-'));
+process.env.AIBOX_HOME=tmp;process.env.AIBOX_ROOT=path.join(tmp,'wx-router');
+try {
+ fs.mkdirSync(path.join(tmp,'bin'),{recursive:true});fs.mkdirSync(path.join(tmp,'.aibox'));
+ const collector=`import fs from 'node:fs';import path from 'node:path';const d=path.join(process.env.AIBOX_HOME,'.aibox');fs.appendFileSync(path.join(d,'calls'),'1');await new Promise(r=>setTimeout(r,150));fs.writeFileSync(path.join(d,'quota.json'),JSON.stringify({snapshotId:'refreshed',updatedAt:new Date().toISOString(),go:{ok:true,observedAt:new Date().toISOString(),windows:{'5小时':{usedPercent:10,resetsAt:new Date(Date.now()+3600000).toISOString()}}}}));`;
+ fs.writeFileSync(path.join(tmp,'bin/aibox-quota.mjs'),collector);
+ const R=await import('../src/core/quota-runtime.mjs');
+ const [a,b]=await Promise.all([R.refreshQuota({force:true}),R.refreshQuota({force:true})]);
+ assert.equal(a.id,b.id);assert.equal(fs.readFileSync(path.join(tmp,'.aibox/calls'),'utf8'),'1');
+ let count=0;
+ await Promise.all([1,2,3].map(()=>R.withLock('dispatch-test',async()=>{assert.equal(count++,0);await new Promise(r=>setTimeout(r,30));count--;})));
+ const moduleUrl=new URL('../src/core/quota-runtime.mjs',import.meta.url).href;
+ const child=spawn(process.execPath,['--input-type=module','-e',`const {withLock}=await import(${JSON.stringify(moduleUrl)});await withLock('exit-test',()=>process.exit(0));`],{env:process.env});
+ await new Promise(r=>child.on('close',r));assert.equal(fs.existsSync(path.join(tmp,'.aibox/exit-test.lock')),false,'CLI exit releases lock');
+ fs.mkdirSync(path.join(tmp,'.aibox/helper-jobs/test'),{recursive:true});
+ const q=R.quotaSnapshot(),reset=q.providers.go.windows['5小时'].resetAt;
+ fs.writeFileSync(path.join(tmp,'.aibox/helper-jobs/test/meta.json'),JSON.stringify({helper:'go',status:'running',runnerPid:process.pid,quotaReservation:{cost:{'5小时':10},resets:{'5小时':reset}}}));
+ assert.equal(R.reservations(q).length,1);
+ console.log('Quota reset/freshness/all caps/expiry urgency/WorkBuddy buckets/reservations/concurrency/refresh locks verified');
+}finally{fs.rmSync(tmp,{recursive:true,force:true});}

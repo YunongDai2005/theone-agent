@@ -9,6 +9,8 @@ import core from './scenarios/core.mjs';
 import interaction from './scenarios/interaction.mjs';
 import memory from './scenarios/memory.mjs';
 import product from './scenarios/product.mjs';
+import native from './scenarios/native.mjs';
+import board from './scenarios/board.mjs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 
@@ -17,7 +19,7 @@ const opt = (k, d) => (args.includes(k) ? args[args.indexOf(k) + 1] : d);
 const engines = opt('--engine', 'v2') === 'both' ? ['v2', 'v1'] : [opt('--engine', 'v2')];
 const only = opt('--only', '');
 const J = Number(opt('-j', '4'));
-const all = [...core, ...interaction, ...memory, ...product].filter((s) => !only || s.name.includes(only));
+const all = [...core, ...interaction, ...memory, ...product, ...board, ...native].filter((s) => !only || s.name.includes(only));
 
 const jobs = [];
 for (const engine of engines) for (const s of all) if (!(engine === 'v1' && s.v1 === false)) jobs.push({ engine, s });
@@ -43,6 +45,8 @@ async function runOne({ engine, s }) {
 
 // 纯逻辑单元测试（自测脚本）
 const unit = [
+  ['额度路由单元测试', [path.join(APP_DIR, 'test/unit-quota.mjs')]],
+  ['消息回执单元测试', [path.join(APP_DIR, 'test/unit-receipts.mjs')]],
   ['话题路由离线自测', [path.join(APP_DIR, 'test/threads-selftest.mjs')]],
   ['自进化单元测试', [path.join(APP_DIR, 'test/unit-evolve.mjs')]],
 ];

@@ -76,6 +76,10 @@ This is the direction of the project. The dedicated Session Administrator, hiera
 | Context handoffs | Session metadata, handoff documents, and recall hooks help carry context into another session. |
 | Media handling | The WeChat adapter handles text, voice transcripts, images, and file delivery. |
 | Quota-aware advisor scheduling | Helper auto-selection filters unavailable or nearly exhausted providers, then asks a Manager model to choose using task difficulty, remaining quota, reset windows, and usage preferences. A rule-based fallback handles unavailable Manager responses. |
+| Quota-aware execution routing | Before each turn the main worker picks Go, WorkBuddy, or DeepSeek from one shared quota policy (safety reserves, in-flight reservations, near-reset priority, concurrency caps), with a two-tier fallback when a route fails. A reading past its reset time is shown as "reset pending" until a fresh reading confirms it. |
+| Resident worker mode (optional) | With `dshTransport: "service"`, the gateway drives a long-running local DSH service. Compatible additions are steered into the worker's next step instead of restarting the turn; native questions and tool approvals are relayed to the chat; orphaned runs are cleaned up on restart. |
+| Delivery receipts | Manager notes move through `pending → accepted → delivered → applied` in an append-only ledger, so a note that was only accepted is never reported as handled. |
+| Modular dashboard | Each feature registers its own cards (`app.widget`). JSON cards placed in `~/.aibox/widgets/` load without a restart. `web/index.html` renders desktop and mobile layouts from `GET /api/v2/board`. |
 | Optional helper workers | Scripts can invoke additional model/CLI helpers, including worktree-based code tasks. |
 | Optional review and improvement | Signals, bounded parameter tuning, and proposed code changes with approval and deployment steps. |
 | Replay testing | Fake messaging, worker, and model services exercise the gateway without real accounts. |
@@ -84,7 +88,7 @@ This is the direction of the project. The dedicated Session Administrator, hiera
 
 - **The Manager is not yet the universal entry point.** It primarily handles messages while the worker is busy; ordinary topic routing is a separate stage in the execution pipeline.
 - **Execution is serial per chat.** Multiple topic sessions exist, but independent topics in one chat do not yet execute concurrently through the main queue.
-- **The queue is in memory.** Restart-safe task recovery and delivery acknowledgments are not implemented.
+- **The local queue is in memory.** Service mode cleans up orphaned worker runs and Manager notes carry delivery receipts, but accepted tasks are not yet persisted and replayed after a restart.
 - **New Manager notes carry chat, run, and topic bindings.** Scoped workers read their own notes; deferred delivery waits for the matching foreground topic. Legacy unbound notes and global question files still need migration before broader multi-user use.
 - **This is a source release for integration.** Real deployment requires your own DSH configuration, OpenClaw WeChat plugin, accounts, and model access.
 
@@ -186,12 +190,14 @@ The complete supporting scripts use this example layout:
 1. Place the repository at `/home/aibox/wx-router`. Inspect `~/bin` for name conflicts before copying the supplied `bin/` scripts there, and create `~/dsh-work`.
 2. Copy `config.example.json` to `config.json`. Set `accountFile`, `pluginDir`, `dshBin`, `dshCwd`, provider/model settings, and `realBase` for your installation.
 3. **Set `realBase` to the original iLink upstream.** Configure the OpenClaw WeChat channel to use the local proxy at `http://127.0.0.1:8787`. Using that proxy address as the upstream would create a loop.
-4. Configure the DSH `headless` profile and its fallback patch yourself. Manager model calls read `OPENCODE_GO_API_KEY` and `DEEPSEEK_API_KEY` from `~/.dsh/.credentials.yaml`. Adjust provider endpoints and model names to your available services.
+4. Configure the DSH `headless` profile and its fallback patch yourself. Manager model calls read `OPENCODE_GO_API_KEY` and `DEEPSEEK_API_KEY` (and, if you run a local WorkBuddy gateway, `WORKBUDDY_GATEWAY_API_KEY`) from `~/.dsh/.credentials.yaml`. Adjust provider endpoints and model names to your available services.
 5. Run `npm start` in the foreground. Check `/healthz` and `http://127.0.0.1:8788/api/v2/status`, then verify the real messaging path. Only then install `ops/wx-router.service`, adjusting its Node executable path.
 
 The v2 core supports `AIBOX_HOME`, `AIBOX_ROOT`, and `AIBOX_CONFIG`. Legacy v1 and some `bin/` and `ops/` scripts still assume `/home/aibox`; a different layout requires corresponding edits. The WeChat adapter imports plugin internals, so verify the module layout against your installation.
 
-The example configuration disables helper workers, local-model routing, and automated review. Configure their dependencies before enabling them. The system dashboard, MCP control services, third-party frameworks, and model weights are not bundled.
+The example configuration disables helper workers, local-model routing, and automated review. Configure their dependencies before enabling them. Two hardware- or privacy-sensitive plugins are off by default: `transcript` (keeps a local copy of incoming message text) and `sdr` (controls a local radio receiver service).
+
+The dashboard frontend is `web/index.html`: serve it with any static web server and proxy `/api/v2/*` to `127.0.0.1:8788`. To preview it with fake data, run `node test/dev-dashboard.mjs` and open `http://127.0.0.1:8933/`. Machine-status cards read an optional `systemStatusUrl`; without one they show as unavailable. MCP control services, third-party frameworks, and model weights are not bundled.
 
 ### Privacy and access
 
@@ -223,10 +229,13 @@ The priorities follow the single-chat experience:
 | `src/core/` | Configuration, plugin registration, logging, and model clients |
 | `src/channel/` | WeChat transport and media handling |
 | `src/evolve/` | Review signals, bounded tuning, and improvement proposals |
+| `src/observe/` | Live run state, daily metrics, and the dashboard card registry |
+| `src/tools/` | Command-line tools, such as `widget` for checking and adding dashboard cards |
+| `web/` | Dashboard frontend (a renderer for the cards served by the gateway) |
 | `bin/` and `ops/` | Optional helper tools and Linux operations examples |
 | `test/` | Fake services, replay scenarios, and unit tests |
 
-Detailed documents currently remain in Chinese: [architecture](docs/ARCHITECTURE.md), [review workflow](docs/EVOLVE.md), [project inventory](docs/PROJECT-OVERVIEW.md), and [publication scope](docs/PUBLICATION.md).
+Detailed documents currently remain in Chinese: [architecture](docs/ARCHITECTURE.md), [review workflow](docs/EVOLVE.md), [dashboard cards](docs/WIDGETS.md), [resident worker mode](docs/DSH-SERVICE.md), [quota routing](docs/QUOTA-ROUTING.md), [project inventory](docs/PROJECT-OVERVIEW.md), and [publication scope](docs/PUBLICATION.md).
 
 ## Contributing
 

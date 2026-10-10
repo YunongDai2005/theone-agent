@@ -2,6 +2,7 @@
  * AI Box 网关 v2 入口：装配插件 → 起微信代理（:8787）和面板 API（:8788）。
  * 插件的顺序就是它们在各挂点上的默认优先级来源之一；真正的先后由每个挂点的 order 决定。
  */
+import { prepareService } from './agent/service-runner.mjs';
 import { cfg, validate } from './core/config.mjs';
 import { log, fatal, emit, errText, tag } from './core/log.mjs';
 import { createApp } from './core/app.mjs';
@@ -20,6 +21,11 @@ import manager from './plugins/manager.mjs';
 import steer from './plugins/steer.mjs';
 import observe from './plugins/observe.mjs';
 import evolve from './plugins/evolve.mjs';
+import board from './plugins/board.mjs';
+import system from './plugins/system.mjs';
+import transcript from './plugins/transcript.mjs';
+import interaction from './plugins/interaction.mjs';
+import sdr from './plugins/sdr.mjs';
 
 // 任何没接住的异常只记录、不退出：让正在跑的轮次有机会自己收尾
 process.on('uncaughtException', (e) => fatal('uncaughtException: ' + String((e && e.stack) || e)));
@@ -30,7 +36,7 @@ if (errs.length) { fatal('配置有误，拒绝启动：\n  ' + errs.join('\n  '
 
 export const app = createApp(cfg);
 app.agent = createAgent(app);
-for (const p of [corePlugin, observe, modes, progress, handoff, recall, helpers, topics, stop, manager, steer, evolve]) app.use(p);
+for (const p of [corePlugin, observe, board, system, modes, progress, handoff, recall, helpers, topics, stop, interaction, manager, steer, evolve, transcript, sdr]) app.use(p);
 
 // ---------- 入站：每条消息先过命令，再按 order 过入站管道 ----------
 function findCommand(t, mode) {
@@ -76,6 +82,7 @@ async function onUpdates(msgs) {
   return { keep, consumed };
 }
 
+await prepareService();
 live.init();
 const server = wx.createProxy({ onUpdates });
 server.listen(cfg.listenPort, cfg.listenHost, () => {
